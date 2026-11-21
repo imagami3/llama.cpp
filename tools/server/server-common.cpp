@@ -1511,6 +1511,15 @@ json oaicompat_chat_params_parse(
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
+    // GB10/ink2 (B70's report, 11/21): thinking turned off by enable_thinking (the kwarg, or the server's default) with no
+    // reasoning_effort reached Inkling's template as a missing effort, which it maps to 0.9 (the deepest thinking); the
+    // template reads only reasoning_effort, so pass "none" (its effort_map: 0)
+    if (!inputs.enable_thinking && inputs.chat_template_kwargs.find("reasoning_effort") == inputs.chat_template_kwargs.end()) {
+        static const bool tmpl_has_effort_map_off = common_chat_templates_source(opt.tmpls.get()).find("effort_map") != std::string::npos;
+        if (tmpl_has_effort_map_off) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json("none").dump();
+        }
+    }
 
     inputs.force_pure_content = opt.force_pure_content;
 
