@@ -130,6 +130,9 @@ struct llama_model_loader {
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
+    // GB10/ink2: B70's public Inkling 2 TQ1 GGUF read as is (names, TQ2T experts, signs): the tensors whose data layout is
+    // fixed after loading: (name, kind) with kind 1 = transpose [a, b] -> [b, a], 2 = transpose and reverse the taps
+    std::vector<std::pair<std::string, int>> ink_pub_fix;
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);

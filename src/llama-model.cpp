@@ -318,6 +318,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_lfm2moe(params);
         case LLM_ARCH_LFM3:
             return new llama_model_lfm3(params);
+        case LLM_ARCH_INKLING2:
+            return new llama_model_inkling2(params);
         case LLM_ARCH_SMALLTHINKER:
             return new llama_model_smallthinker(params);
         case LLM_ARCH_GROVEMOE:
@@ -2064,6 +2066,47 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // GB10/ink2: the public Inkling 2 TQ1's two layout fixes (llama-model-loader.cpp, LLAMA_INK_PUBLIC): the bytes were
+    // loaded as stored ([b, a] read as this fork's [a, b]); 1 = transpose, 2 = transpose and reverse the taps (ne[1])
+    for (const auto & [name, kind] : ml.ink_pub_fix) {
+        ggml_tensor * t = nullptr;
+        for (auto & [ctx, bufs] : ctx_bufs) {
+            if ((t = ggml_get_tensor(ctx, name.c_str()))) {
+                break;
+            }
+        }
+        if (!t) {
+            throw std::runtime_error(format("public Inkling 2 TQ1: tensor %s to fix not found", name.c_str()));
+        }
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+        const int64_t A = t->ne[0], B = t->ne[1];
+        std::vector<float> in((size_t) (A*B)), out((size_t) (A*B));
+        ggml_backend_tensor_get(t, in.data(), 0, ggml_nbytes(t));
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t a = 0; a < A; ++a) {
+                const int64_t bs = kind == 2 ? B - 1 - b : b;
+                out[b*A + a] = in[a*B + bs];   // stored [B, A]: element (bs, a) at a*B + bs
+            }
+        }
+        ggml_backend_tensor_set(t, out.data(), 0, ggml_nbytes(t));
+    }
+
+    // ink2-rvq: RVQ2X8 expert tensors in device buffers get the backend's one-time layout repack (CUDA: K-tile-major)
+    for (auto & [ctx, bufs] : ctx_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_RVQ2X8 || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto * fn = reg ? (void (*)(ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_rvq_repack") : nullptr;
+            if (!fn) {
+                throw std::runtime_error(format("RVQ2X8 tensor %s is on a backend without RVQ support", t->name));
+            }
+            fn(t);
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -3180,7 +3223,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3532,6 +3575,7 @@ int32_t llama_n_head(const llama_model * model) {
 llama_rope_type llama_model_rope_type(const llama_model * model) {
     switch (model->arch) {
         // these models do not use RoPE
+        case LLM_ARCH_INKLING2:
         case LLM_ARCH_CLIP:
         case LLM_ARCH_GPT2:
         case LLM_ARCH_GPTJ:

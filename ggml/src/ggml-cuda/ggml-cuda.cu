@@ -33,6 +33,9 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/rvq.cuh"
+#include "ggml-cuda/tq.cuh"
+#include "ggml-cuda/l2clip.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1852,6 +1855,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+    if ((ffn_up->src[0] && (ffn_up->src[0]->type == GGML_TYPE_RVQ2X8 || ffn_up->src[0]->type == GGML_TYPE_TQ2T)) ||
+        (ffn_gate->src[0] && (ffn_gate->src[0]->type == GGML_TYPE_RVQ2X8 || ffn_gate->src[0]->type == GGML_TYPE_TQ2T))) {
+        return false;   // ink2-rvq: own kernels, no fusion
+    }
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1971,6 +1978,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (src0->type == GGML_TYPE_RVQ2X8 || src0->type == GGML_TYPE_TQ2T) {
+        return false;   // ink2-rvq / ink2-tq: own kernels, no fusion
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2170,6 +2181,14 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (src0->type == GGML_TYPE_RVQ2X8) {
+        return ggml_cuda_mul_mat_id_rvq_needs_sync(dst);
+    }
+    if (src0->type == GGML_TYPE_TQ2T) {
+        // GB10/ink2: the GPU-sorted multi prefill (tq.cu, GGML_TQ_GSORT) has no host sync, so prefill graphs can be captured
+        return ggml_cuda_mul_mat_id_tq_needs_sync(dst) && !ggml_cuda_tq_pf_graph_ok(dst);
+    }
+
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -2201,6 +2220,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    if (src0->type == GGML_TYPE_RVQ2X8) {
+        ggml_cuda_mul_mat_id_rvq(ctx, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_TQ2T) {
+        ggml_cuda_mul_mat_id_tq(ctx, dst);
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -2892,7 +2920,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // the first node's address alone collides when a context alternates graphs built in the same memory (a DSpark
+    // drafter: feature encode, then the noise block), and every call then resets the other graph's warmup. Mix in the
+    // node count and the first and last nodes' shapes (env GGML_CUDA_GRAPH_KEY_SHAPE=0: the address only).
+    const bool shape = ggml_cuda_rvq_knob("GGML_CUDA_GRAPH_KEY_SHAPE", 1) != 0;
+    if (!shape || cgraph->n_nodes == 0) {
+        return cgraph->nodes[0];
+    }
+    const ggml_tensor * f = cgraph->nodes[0];
+    const ggml_tensor * l = cgraph->nodes[cgraph->n_nodes - 1];
+    uint64_t h = (uint64_t) (uintptr_t) f;
+    const uint64_t v[] = { (uint64_t) cgraph->n_nodes, (uint64_t) f->ne[0], (uint64_t) f->ne[1], (uint64_t) f->ne[2],
+                           (uint64_t) l->ne[0], (uint64_t) l->ne[1], (uint64_t) l->ne[2], (uint64_t) (uintptr_t) l };
+    for (const uint64_t x : v) {
+        h ^= x + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2931,6 +2974,26 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // env GGML_CUDA_GRAPH_WHY=N: report the first N mismatches (node, which part differs)
+            static int why = [] { const char * v = getenv("GGML_CUDA_GRAPH_WHY"); return v ? atoi(v) : 0; }();
+            if (!res && why > 0) {
+                --why;
+                const ggml_tensor & o = graph->node_props[i].node;
+                const ggml_tensor * n = cgraph->nodes[i];
+                int src_d = -1;
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (graph->node_props[i].node_src_data_ptrs[j] != prop.node_src_data_ptrs[j] ||
+                        memcmp(graph->node_props[i].node_src_ne[j], prop.node_src_ne[j], sizeof(prop.node_src_ne[j])) ||
+                        memcmp(graph->node_props[i].node_src_nb[j], prop.node_src_nb[j], sizeof(prop.node_src_nb[j]))) {
+                        src_d = j;
+                        break;
+                    }
+                }
+                GGML_LOG_WARN("cuda graph changed: n_nodes %d, node %d %s (%s): data %d ne %d nb %d op_params %d src_ptrs %d src[%d] differs, flags %d\n",
+                    cgraph->n_nodes, i, n->name, ggml_op_desc(n), o.data != n->data, memcmp(o.ne, n->ne, sizeof(o.ne)) != 0,
+                    memcmp(o.nb, n->nb, sizeof(o.nb)) != 0, memcmp(o.op_params, n->op_params, sizeof(o.op_params)) != 0,
+                    memcmp(o.src, n->src, sizeof(o.src)) != 0, src_d, o.flags != n->flags);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -3948,6 +4011,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        // RVQ2X8 decode: the gate/up expert groups of a layer in one launch
+        const int n_rvq = ggml_cuda_rvq_multi_match(cgraph, i);
+        if (n_rvq >= 2) {
+            ggml_cuda_rvq_multi(*cuda_ctx, cgraph, i, n_rvq);
+            return n_rvq - 1;
+        }
+        const int n_dn = ggml_cuda_rvq_down_match(cgraph, i);
+        if (n_dn >= 2) {
+            ggml_cuda_rvq_down_multi(*cuda_ctx, cgraph, i, n_dn);
+            return n_dn - 1;
+        }
+        // TQ2T decode: the same for B70's trellis experts
+        const int n_tq = ggml_cuda_tq_gu_match(cgraph, i);
+        if (n_tq >= 2) {
+            ggml_cuda_tq_gu_multi(*cuda_ctx, cgraph, i, n_tq);
+            return n_tq - 1;
+        }
+        const int n_tqd = ggml_cuda_tq_down_match(cgraph, i);
+        if (n_tqd >= 2) {
+            // prefill: the weighted sum over the experts straight from the down kernel (GGML_TQ_REDFUSE)
+            static const bool redfuse = [] { const char * v = getenv("GGML_TQ_REDFUSE"); return v && atoi(v) != 0; }();
+            const int j = i + n_tqd;
+            ggml_cuda_moe_weighted_reduction_match rm;
+            if (redfuse && j < cgraph->n_nodes && ggml_cuda_match_moe_weighted_reduction(cgraph, j, rm) &&
+                    rm.experts == cgraph->nodes[j - 1] && ggml_node_has_n_uses(cgraph, j - 1, 1)) {
+                const int output_idx = j + rm.node_count - 1;
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, j, rm.node_count, &output_idx, 1) &&
+                        ggml_cuda_tq_down_multi_red(*cuda_ctx, cgraph, i, n_tqd, rm.dst, rm.weights, rm.expert_scale)) {
+                    return n_tqd - 1 + rm.node_count;
+                }
+            }
+            ggml_cuda_tq_down_multi(*cuda_ctx, cgraph, i, n_tqd);
+            return n_tqd - 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -4747,8 +4847,45 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (node->op == GGML_OP_SSM_CONV) {
+        const int skip = ggml_cuda_sconv_match(cgraph, i);
+        if (skip) {
+            ggml_cuda_op_sconv_fused(*cuda_ctx, cgraph, i, i + skip);
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int span = ggml_cuda_attnres_match(cgraph, i);   // score chain of an attention residual: done by its resw node
+        if (span) {
+            return span - 1;
+        }
+    }
+
+    if (node->op == GGML_OP_CONT && ggml_cuda_resw_match(cgraph, i)) {
+        if (!ggml_cuda_attnres_fused(*cuda_ctx, cgraph, i)) {
+            ggml_cuda_op_resw_fused(*cuda_ctx, cgraph, i);
+        }
+        return 1;
+    }
+
+    if (node->op == GGML_OP_CPY) {
+        const int span = ggml_cuda_mcpy_match(cgraph, i);
+        if (span) {
+            ggml_cuda_op_mcpy_fused(*cuda_ctx, cgraph, i, span);
+            return span - 1;
+        }
+    }
+
+    if (node->op == GGML_OP_SQR && ggml_cuda_l2clip_match(cgraph, i)) {
+        ggml_cuda_op_l2clip_fused(*cuda_ctx, cgraph, i);
+        return 5;
+    }
+
     return 0;
 }
+
+ggml_cuda_eval_pos g_ggml_cuda_eval_pos = { nullptr, 0, 0, false };
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
@@ -4855,6 +4992,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            g_ggml_cuda_eval_pos.epoch++;
+            g_ggml_cuda_eval_pos.cgraph = cgraph;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -4906,6 +5045,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                g_ggml_cuda_eval_pos.i             = i;
+                g_ggml_cuda_eval_pos.single_stream = !is_concurrent_event_active && cuda_ctx->curr_stream_no == 0;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4945,6 +5086,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            g_ggml_cuda_eval_pos.cgraph = nullptr;
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -5014,7 +5156,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const int rvq_ep = ggml_cuda_rvq_ctl_poll();
+            if (graph->rvq_ctl_epoch != rvq_ep) {
+                graph->rvq_ctl_epoch = rvq_ep;
+                graph->warmup_complete = false;   // re-capture with the new knob values
+                properties_changed = true;
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5052,6 +5200,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    }
+
+    // env GGML_CUDA_GRAPH_STATS=N: every N graph computes print how many were captured, replayed or run eagerly,
+    // split by graph size (small: < 2000 nodes, e.g. a drafter)
+    {
+        static const int stats = [] { const char * v = getenv("GGML_CUDA_GRAPH_STATS"); return v ? atoi(v) : 0; }();
+        if (stats) {
+            static int st[2][3] = {}, st_n = 0;
+            const int big = cgraph->n_nodes >= 2000;
+            st[big][use_cuda_graph ? (cuda_graph_update_required ? 0 : 1) : 2]++;
+            if (++st_n >= stats) {
+                GGML_LOG_WARN("cuda graph stats: small (capture %d, replay %d, eager %d), big (capture %d, replay %d, eager %d)\n",
+                    st[0][0], st[0][1], st[0][2], st[1][0], st[1][1], st[1][2]);
+                memset(st, 0, sizeof(st));
+                st_n = 0;
+            }
+        }
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
@@ -5814,6 +5979,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (a->type == GGML_TYPE_RVQ2X8 || a->type == GGML_TYPE_TQ2T) {   // ink2-rvq / ink2-tq: experts only (gains + codebook / signs in src[3] / src[4])
+                    return op->op == GGML_OP_MUL_MAT_ID && b->type == GGML_TYPE_F32 && ggml_is_contiguous(a);
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
@@ -6392,6 +6560,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_rvq_repack") == 0) {
+        return (void *)ggml_backend_cuda_rvq_repack;
     }
     return nullptr;
 }

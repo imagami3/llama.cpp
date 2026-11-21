@@ -1,5 +1,6 @@
 #include "scale.cuh"
 #include "convert.cuh"
+#include "l2clip.cuh"
 
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
@@ -45,6 +46,14 @@ static void scale_f32_cuda(const T * x, T * dst, const float scale, const float 
 }
 
 void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->op_params[8] == GGML_CUDA_INK_SCONV_MAGIC) {
+        ggml_cuda_op_ink_sconv(ctx, dst);   // GB10/ink2: the static short conv from the tokens + cached state (l2clip.cuh)
+        return;
+    }
+    if (dst->op_params[8] == GGML_CUDA_INK_DCONV_MAGIC) {
+        ggml_cuda_op_ink_dconv(ctx, dst);   // GB10/ink2: the whole dynamic short conv (l2clip.cuh)
+        return;
+    }
     const ggml_tensor * src0 = dst->src[0];
     cudaStream_t stream = ctx.stream();
 

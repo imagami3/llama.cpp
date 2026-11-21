@@ -18,6 +18,35 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// GB10/ink2: Inkling 2 attention through the MMA kernel. A FLASH_ATTN_EXT node with op_params[10] == this magic carries
+// a per-token sink {n_head, n_tokens} in src[4], the raw relative-logit table {E, n_head*n_tokens} in src[5] and the
+// row index {n_kv, n_tokens} (I32, value t*(E+1) + d, d == E: no bias) in src[6]; op_params[11] = E. The logit is
+// scale*q.k + mask + rel[t][h][d], the sink is one extra softmax column per (token, head) with no value.
+// The kernel gets a pointer to ggml_cuda_ink_fa_args in place of the sinks and logit_softcap < 0 as the flag.
+#define GGML_CUDA_INK_FA_MAGIC 0x494e4b46
+struct ggml_cuda_ink_fa_args {
+    const float   * sinks;   // [t*sink_s1 + h]
+    const float   * rel;     // [(t*nh + h)*E + d]
+    const int32_t * idx;     // [t*idx_s1 + j]
+    int sink_s1, idx_s1, E, nh, nt;
+    int t0;   // GB10 sender: global token index of this call's first query (idx values are t_global*(E+1) + d)
+    // drel > 0 (op_params[13]): no table, the bias is computed in the kernel as dot(r[t][h][:], P[d][:]) (drel values each);
+    // rr = r {drel, nh*n_tokens} (src[5]), P = rel_proj transposed {drel, E} (src[7])
+    const float * rr;
+    const float * P;
+    int drel;
+    int p16;   // P is F16
+    int dbg;   // GGML_INK_FA_DBG (investigation only): 1 = the kernel ignores KV_max
+    int idxs;  // GGML_INK_FA_IDXS (default 1): the MMA kernel stages each KV tile's idx rows in shared memory (cp.async with
+               // the mask) instead of one global load a score; same values, same sums (bit-identical)
+};
+static inline bool ggml_cuda_is_ink_fa(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_FLASH_ATTN_EXT && dst->op_params[10] == GGML_CUDA_INK_FA_MAGIC;
+}
+static __global__ void ggml_cuda_ink_fa_set_args(ggml_cuda_ink_fa_args * dst, const ggml_cuda_ink_fa_args a) {
+    *dst = a;
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -666,6 +695,48 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// GB10/ink2: the lower edge of the first FATTN_KQ_STRIDE tile with a non-masked value of each ncols1 rows (sliding-window
+// layers: the keys before the window are skipped by the MMA kernel). Written after the ne31*ne33 KV_max values.
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+static __global__ void flash_attn_mask_to_KV_min(
+        const half2 * mask_ptr, int * KV_min_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+    const half2 * GGML_CUDA_RESTRICT mask = mask_ptr;
+    const int ne31     = gridDim.x;
+    const int tid      = threadIdx.x;
+    const int sequence = blockIdx.y;
+    const int jt       = blockIdx.x;
+    mask += sequence*s33 + jt*ncols1*s31;
+    __shared__ int buf_iw[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 1;
+    }
+    __syncthreads();
+    int sj = 0;
+    for (; sj < ne30 * FATTN_KQ_STRIDE; sj += FATTN_KQ_STRIDE) {
+        int all_inf = 1;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const float2 tmp = __half22float2(mask[j*s31 + sj/2 + tid]);
+            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+        }
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+        if (!all_inf) {
+            break;
+        }
+    }
+    if (threadIdx.x == 0) {
+        KV_min_ptr[sequence*ne31 + jt] = sj < ne30 * FATTN_KQ_STRIDE ? sj : 0;
+    }
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
@@ -1114,7 +1185,10 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    // GB10/ink2 (env GGML_INK_FA_KVMIN, default 1): also scan for the first visible tile (sliding-window layers), from 64 queries
+    static const bool ink_kvmin = [] { const char * v = getenv("GGML_INK_FA_KVMIN"); return !v || atoi(v) != 0; }();
+    const bool scan_min  = ink_kvmin && ggml_cuda_is_ink_fa(KQV) && !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 64;
+    const bool scan_mask = scan_min || (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1));
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1125,11 +1199,16 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        KV_max.alloc(scan_min ? 2*ne_KV_max : ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
+        if (scan_min) {
+            flash_attn_mask_to_KV_min<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>(
+                (const half2 *) mask->data, KV_max.ptr + ne_KV_max, iter_k, s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1144,7 +1223,11 @@ void launch_fattn(
     dim3 blocks_num;
     if (stream_k) {
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
-        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
+        // GB10/ink2 (env GGML_INK_FA_WHOLE, default 0): the Inkling path keeps stream-K; whole tiles with the async KV preload
+        // gave wrong logits there (wikitext c4096 ub2048 PPL 204-306 vs 8.67, 11/20 15:2x)
+        static const bool ink_whole = [] { const char * v = getenv("GGML_INK_FA_WHOLE"); return v && atoi(v) != 0; }();
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask &&
+            (ink_whole || !ggml_cuda_is_ink_fa(KQV));
 
         auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
@@ -1245,6 +1328,57 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    // GB10/ink2: the Inkling extras go to the kernel as a small device struct in place of the sinks (see the magic)
+    const char * sinks_arg = sinks ? (const char *) sinks->data : nullptr;
+    ggml_cuda_pool_alloc<ggml_cuda_ink_fa_args> ink_dev(pool);
+    if (ggml_cuda_is_ink_fa(KQV)) {
+        const ggml_tensor * rel = KQV->src[5], * idx = KQV->src[6];
+        GGML_ASSERT(sinks && rel && idx && sinks->type == GGML_TYPE_F32 && rel->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(rel) && idx->nb[0] == sizeof(int32_t) && sinks->nb[0] == sizeof(float));
+        GGML_ASSERT(logit_softcap == 0.0f && max_bias == 0.0f && Q->ne[3] == 1);
+        ggml_cuda_ink_fa_args a;
+        a.sinks   = (const float *) sinks->data;
+        a.rel     = (const float *) rel->data;
+        a.idx     = (const int32_t *) idx->data;
+        a.sink_s1 = (int) (sinks->nb[1] / sizeof(float));
+        a.idx_s1  = (int) (idx->nb[1] / sizeof(int32_t));
+        a.E       = KQV->op_params[11];
+        a.nh      = (int) Q->ne[2];
+        a.nt      = (int) Q->ne[1];
+        a.t0      = KQV->op_params[12];
+        a.drel    = KQV->op_params[13];
+        a.p16     = 0;
+        static const int fa_dbg = [] { const char * v = getenv("GGML_INK_FA_DBG"); return v ? atoi(v) : 0; }();
+        a.dbg     = fa_dbg;
+        static const int fa_idxs = [] { const char * v = getenv("GGML_INK_FA_IDXS"); return v ? atoi(v) : 1; }();
+        a.idxs    = fa_idxs && ((uintptr_t) idx->data) % 16 == 0 && a.idx_s1 % 4 == 0 && n_kv % 256 == 0;
+        a.rr      = nullptr;
+        a.P       = nullptr;
+        if (a.drel > 0) {   // r and P in place of the table
+            const ggml_tensor * P = KQV->src[7];
+            GGML_ASSERT(a.drel == 16 && P && (P->type == GGML_TYPE_F32 || P->type == GGML_TYPE_F16) && ggml_is_contiguous(P) && P->ne[0] == a.drel && P->ne[1] == a.E);
+            a.p16 = P->type == GGML_TYPE_F16;
+            GGML_ASSERT(rel->ne[0] == a.drel && rel->nb[1] == a.drel*sizeof(float) && rel->ne[1] == (int64_t) Q->ne[2]*Q->ne[1]);
+            GGML_ASSERT(((uintptr_t) rel->data) % 16 == 0 && ((uintptr_t) P->data) % 16 == 0);
+            a.rr  = (const float *) rel->data;
+            a.P   = (const float *) P->data;
+            a.rel = nullptr;
+            if (a.p16) {
+                a.drel = -a.drel;   // the kernel reads one field: drel < 0 means P is F16
+            }
+        } else {
+            GGML_ASSERT(rel->ne[0] == a.E);
+        }
+        GGML_ASSERT(a.E > 0 && sinks->ne[0] == Q->ne[2] && idx->ne[1] == Q->ne[1] && idx->ne[0] >= n_kv);
+        ink_dev.alloc(1);
+        // written by a 1-thread kernel (args by value), not cudaMemcpyAsync from the host: a CUDA graph would replay
+        // the copy from this stack frame
+        ggml_cuda_ink_fa_set_args<<<1, 1, 0, main_stream>>>(ink_dev.ptr, a);
+        CUDA_CHECK(cudaGetLastError());
+        sinks_arg     = (const char *) ink_dev.ptr;
+        logit_softcap = -1.0f;   // the flag (the template keeps use_logit_softcap == false: op_params[2] == 0)
+    }
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
@@ -1253,7 +1387,7 @@ void launch_fattn(
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
-        sinks ? ((const char *) sinks->data) : nullptr,
+        sinks_arg,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

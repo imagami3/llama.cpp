@@ -719,6 +719,114 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // GB10/ink2 env LLAMA_INK_PUBLIC (default 1, 0 = off): B70's public Inkling 2 TQ1 (w/mk_tq_mixed.py, PR #32217
+    // converter names) read as is: tensor names mapped to this fork's, the experts' .tq (I8 [K/16*66, R/16, E]) read as
+    // TQ2T [K*16, R/16, E] (the same 66-byte 16x16 tiles), the global tq.sign.<K> shared as each matrix's .tq_sign,
+    // tq.values (the decoder's table, built into the kernels) dropped; two layout fixes after loading (ink_pub_fix).
+    if (arch_name == "inkling2" && weights_map.count("tq.values")) {
+        static const bool pub_on = [] { const char * v = getenv("LLAMA_INK_PUBLIC"); return !v || atoi(v) != 0; }();
+        if (pub_on) {
+            auto rename = [&](const std::string & from, const std::string & to) {
+                auto nh = weights_map.extract(from);
+                GGML_ASSERT(!nh.empty());
+                nh.key() = to;
+                ggml_set_name(nh.mapped().tensor, to.c_str());
+                weights_map.insert(std::move(nh));
+            };
+            auto swap01 = [](ggml_tensor * t) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_n_dims(t) == 2);
+                std::swap(t->ne[0], t->ne[1]);
+                t->nb[1] = t->nb[0]*t->ne[0]; t->nb[2] = t->nb[1]*t->ne[1]; t->nb[3] = t->nb[2];
+            };
+            static const std::pair<const char *, const char *> NM[] = {
+                {"attn_post_conv", "shortconv_attn"}, {"ffn_post_conv", "shortconv_mlp"}, {"attn_rel", "attn_r"},
+                {"attn_q_inp_norm", "attn_q_in_norm"}, {"attn_k_inp_norm", "attn_k_in_norm"}, {"attn_v_inp_norm", "attn_v_in_norm"},
+                {"attn_res_query", "attnres_attn_q"}, {"ffn_res_query", "attnres_mlp_q"},
+                {"attn_k_conv_proj", "dynconv_k_proj"}, {"attn_v_conv_proj", "dynconv_v_proj"},
+            };
+            std::vector<std::string> names;
+            for (const auto & it : weights_map) {
+                names.push_back(it.first);
+            }
+            std::map<int64_t, std::string> signs;   // K -> tq.sign.<K>
+            std::vector<std::pair<std::string, int64_t>> sign_users;   // (alias name, K)
+            int n_ren = 0, n_tq = 0;
+            for (const auto & n : names) {
+                int il = -1; char rest[256] = {0};
+                if (sscanf(n.c_str(), "blk.%d.%255s", &il, rest) == 2) {
+                    std::string r(rest);
+                    bool done = false;
+                    for (const auto & [from, to] : NM) {
+                        if (r == std::string(from) + ".weight") {
+                            rename(n, format("blk.%d.%s.weight", il, to)); n_ren++; done = true; break;
+                        }
+                    }
+                    if (done) continue;
+                    const bool full = weights_map.count(format("blk.%d.attn_k_conv_proj.weight", il)) || weights_map.count(format("blk.%d.dynconv_k_proj.weight", il));
+                    if (r == "attn_k_conv.weight" || r == "attn_v_conv.weight") {
+                        const char kv = r[5];
+                        if (full) {   // [K, kvw] taps first -> this fork's dynconv static [kvw, K], taps reversed
+                            const std::string to = format("blk.%d.dynconv_%c_static.weight", il, kv);
+                            rename(n, to); swap01(weights_map.at(to).tensor); ink_pub_fix.emplace_back(to, 2);
+                        } else {
+                            rename(n, format("blk.%d.shortconv_%c.weight", il, kv));
+                        }
+                        n_ren++; continue;
+                    }
+                    if (r == "attn_rel_bias.weight") {   // [drel, E] -> attn_rel_proj [E, drel]
+                        const std::string to = format("blk.%d.attn_rel_proj.weight", il);
+                        rename(n, to); swap01(weights_map.at(to).tensor); ink_pub_fix.emplace_back(to, 1); n_ren++; continue;
+                    }
+                    const size_t dot = r.rfind(".tq");
+                    if (dot != std::string::npos && dot + 3 == r.size() && r.find("_exps") != std::string::npos) {
+                        ggml_tensor * t = weights_map.at(n).tensor;
+                        GGML_ASSERT(t->type == GGML_TYPE_I8 && t->ne[0] % 66 == 0);
+                        const size_t nbytes0 = ggml_nbytes(t);
+                        const int64_t K = t->ne[0] / 66 * 16;
+                        t->type  = GGML_TYPE_TQ2T;
+                        t->ne[0] = K * 16;
+                        t->nb[0] = ggml_type_size(GGML_TYPE_TQ2T);
+                        t->nb[1] = ggml_row_size(GGML_TYPE_TQ2T, t->ne[0]);
+                        t->nb[2] = t->nb[1]*t->ne[1];
+                        t->nb[3] = t->nb[2]*t->ne[2];
+                        GGML_ASSERT(ggml_nbytes(t) == nbytes0);
+                        const std::string base = format("blk.%d.%s", il, r.substr(0, dot).c_str());
+                        rename(n, base + ".weight");
+                        sign_users.emplace_back(base + ".tq_sign", K);
+                        n_tq++; continue;
+                    }
+                } else if (n == "output_res_query.weight") {
+                    rename(n, "attnres_out_q.weight"); n_ren++;
+                } else if (n.rfind("tq.sign.", 0) == 0) {
+                    signs[atoll(n.c_str() + 8)] = n;
+                }
+            }
+            // each matrix's sign: a view-less copy of the tensor info at the same file offset
+            {
+                ggml_init_params ip = { ggml_tensor_overhead() * (sign_users.size() + 1), nullptr, true };
+                ggml_context * ctx_alias = ggml_init(ip);
+                for (const auto & [alias, K] : sign_users) {
+                    const auto it = signs.find(K);
+                    if (it == signs.end()) {
+                        throw std::runtime_error(format("public Inkling 2 TQ1: no tq.sign.%lld for %s", (long long) K, alias.c_str()));
+                    }
+                    llama_tensor_weight w = weights_map.at(it->second);
+                    ggml_tensor * t = ggml_dup_tensor(ctx_alias, w.tensor);
+                    ggml_set_name(t, alias.c_str());
+                    w.tensor = t;
+                    weights_map.emplace(alias, w);
+                }
+                contexts.emplace_back(ctx_alias);
+                for (const auto & [K, n] : signs) {
+                    weights_map.erase(n);
+                }
+                weights_map.erase("tq.values");
+            }
+            LLAMA_LOG_WARN("%s: public Inkling 2 TQ1 layout: %d tensors renamed, %d expert matrices as TQ2T, %zu signs shared, %zu layout fixes after loading\n",
+                __func__, n_ren, n_tq, sign_users.size(), ink_pub_fix.size());
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -973,7 +1081,8 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 // Used for either MoE expert routing or embedded adapter routing
                 const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used_max();
                 GGML_ASSERT(n_ids_used > 0);
-                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
+                // ink2-tq: TQ2T experts are 16-row strips [K*16, rows/16, E]
+                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->type == GGML_TYPE_TQ2T ? w->ne[0] / 16 : w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
             } break;

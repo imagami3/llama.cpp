@@ -1,5 +1,8 @@
 #pragma once
 
+// mul_mat_id: expert ids >= this value mark slots to skip (no weight reads, zero output); used by expert groups
+#define GGML_CUDA_MMID_SKIP 16777216u
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
@@ -1284,6 +1287,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    int  rvq_ctl_epoch = 0;   // ggml_cuda_rvq_ctl_poll() epoch at capture: a change forces a re-capture
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1571,6 +1575,16 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// GB10: the node ggml_cuda_graph_evaluate_and_capture is at (cgraph == nullptr outside the loop), for ops that check
+// the nodes between two of their calls (mmq.cu GGML_CUDA_MMQ_Q8_REUSE); epoch counts the evaluations
+struct ggml_cuda_eval_pos {
+    const struct ggml_cgraph * cgraph;
+    int      i;
+    uint64_t epoch;
+    bool     single_stream;
+};
+extern ggml_cuda_eval_pos g_ggml_cuda_eval_pos;
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

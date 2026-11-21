@@ -125,6 +125,24 @@ static __global__ void mm_ids_helper(
     }
 
     expert_bounds[gridDim.x] = nex_prev + it_compact;
+
+    // Expert-group skip slots (ids >= n_experts) belong to no expert. Give their src1 map entries valid targets so the
+    // activation quantization never reads/writes out of bounds: the inverse (scatter) map sends them to the last compact
+    // row, which is unused whenever at least one slot is skipped; the forward map pads the unused tail with row 0.
+    const int n_slots = n_tokens*n_expert_used;
+    if (write_inverse) {
+        for (int it = 0; it < n_tokens; ++it) {
+            for (int iex = 0; iex < n_expert_used; ++iex) {
+                if ((unsigned int) ids[it*si1 + iex] >= gridDim.x) {
+                    ids_src1[it*n_expert_used + iex] = n_slots - 1;
+                }
+            }
+        }
+    } else {
+        for (int i = nex_prev + it_compact; i < n_slots; ++i) {
+            ids_src1[i] = 0;
+        }
+    }
 }
 
 template <int n_expert_used_template>

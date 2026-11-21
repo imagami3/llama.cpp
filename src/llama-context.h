@@ -444,4 +444,6 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    int32_t ub_n = 0, ub_r = 0;   // LLAMA_UB_TIMING
+    int64_t ub_t[3] = {0, 0, 0};
 };

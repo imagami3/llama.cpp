@@ -12,6 +12,7 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 
 // keep this struct lightweight
 struct llama_ubatch {
@@ -221,6 +222,14 @@ private:
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
+
+    // GB10/ink2 (env LLAMA_UBATCH_EMBD_POOL=0: off): recycled per-ubatch embedding buffers. A fresh 75 MB vector for each
+    // DSpark feature-injection ubatch (512 rows x 8 taps x 4608) costs ~45 ms of page faults and zero-filling on GB10
+    struct embd_pool {
+        std::mutex                      mtx;
+        std::vector<std::vector<float>> bufs;
+    };
+    std::shared_ptr<embd_pool> epool = std::make_shared<embd_pool>();
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below

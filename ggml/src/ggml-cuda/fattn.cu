@@ -137,6 +137,9 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+    if (ggml_cuda_is_ink_fa(dst)) {
+        return false;   // GB10/ink2: the sparse gather does not carry the Inkling bias
+    }
 #ifdef GGML_USE_MUSA
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
     return false;
@@ -275,6 +278,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
 
         if (use_gqa_opt && gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+    }
+
+    // GB10/ink2 GGML_INK_FA_NC2 (default 0): Inkling prefill (>= 64 queries) with 2 Q heads a column group instead of 8:
+    // GQA 6 leaves no padded heads (8 pads 2 of 8, whose bias and MMA work is thrown away) and each K/V tile serves the
+    // same 64 columns; the per-column math is the same
+    if (DKQ == 128 && DV == 128 && use_gqa_opt && gqa_ratio % 2 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] >= 64 && ggml_cuda_is_ink_fa(dst)) {
+        static const int nc2 = [] { const char * v = getenv("GGML_INK_FA_NC2"); return v ? atoi(v) : 0; }();
+        if (nc2) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
             return;
         }
@@ -646,6 +660,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // GB10/ink2: the Inkling bias and per-token sinks exist only in the MMA kernel
+    if (ggml_cuda_is_ink_fa(dst)) {
+        return turing_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)
+            ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

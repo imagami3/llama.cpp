@@ -278,7 +278,81 @@ static void top_k_argsort_cuda(
     }
 }
 
+// small k over a short row (MoE routing: top-8 of a few hundred experts): one warp a row, each lane keeps its share of
+// the row in registers; k rounds of a warp argmax. The picks come out in descending order (ties: the lower index),
+// as argsort's first k.
+template <int PER_LANE>
+static __global__ void top_k_warp_f32(const float * __restrict__ x, int * __restrict__ dst, const int ncols, const int nrows, const int k) {
+    const int row  = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (row >= nrows) {
+        return;
+    }
+    const float * xr = x + (size_t) row * ncols;
+    float v[PER_LANE];
+#pragma unroll
+    for (int q = 0; q < PER_LANE; ++q) {
+        const int c = q * 32 + lane;
+        v[q] = c < ncols ? xr[c] : -INFINITY;
+    }
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int   bc = INT_MAX;
+#pragma unroll
+        for (int q = 0; q < PER_LANE; ++q) {
+            const int c = q * 32 + lane;
+            if (c < ncols && (v[q] > bv || (v[q] == bv && c < bc))) {
+                bv = v[q];
+                bc = c;
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            const int   oc = __shfl_xor_sync(0xffffffff, bc, o);
+            if (ov > bv || (ov == bv && oc < bc)) {
+                bv = ov;
+                bc = oc;
+            }
+        }
+        if (lane == 0) {
+            dst[(size_t) row * k + i] = bc;
+        }
+        if (bc % 32 == lane && bc < ncols) {
+#pragma unroll
+            for (int q = 0; q < PER_LANE; ++q) {
+                if (q == bc / 32) {
+                    v[q] = -INFINITY;
+                }
+            }
+        }
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    {   // fast path: k <= 32, ncols <= 1024 (env GGML_CUDA_TOPK_WARP=0: off)
+        static const bool warp_on = [] { const char * v = getenv("GGML_CUDA_TOPK_WARP"); return !v || atoi(v) != 0; }();
+        const ggml_tensor * s0 = dst->src[0];
+        const int64_t nc = s0->ne[0], nr = ggml_nrows(s0), kk = dst->ne[0];
+        if (warp_on && s0->type == GGML_TYPE_F32 && ggml_is_contiguous(s0) && kk <= 32 && nc <= 1024 && kk <= nc) {
+            const int per = (int) ((nc + 31) / 32);
+            const dim3 grid((unsigned) ((nr + 3) / 4));
+            cudaStream_t st = ctx.stream();
+            const float * xd = (const float *) s0->data;
+            int * dd = (int *) dst->data;
+            if (per <= 4) {
+                top_k_warp_f32<4><<<grid, 128, 0, st>>>(xd, dd, (int) nc, (int) nr, (int) kk);
+            } else if (per <= 8) {
+                top_k_warp_f32<8><<<grid, 128, 0, st>>>(xd, dd, (int) nc, (int) nr, (int) kk);
+            } else if (per <= 16) {
+                top_k_warp_f32<16><<<grid, 128, 0, st>>>(xd, dd, (int) nc, (int) nr, (int) kk);
+            } else {
+                top_k_warp_f32<32><<<grid, 128, 0, st>>>(xd, dd, (int) nc, (int) nr, (int) kk);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
     int *               dst_d  = (int *) dst->data;

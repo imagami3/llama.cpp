@@ -397,6 +397,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    // Inkling2 DSpark: separate context K/V projections over the per-layer DFlare mix of the target features
+    struct ggml_tensor * dspark_k_ctx       = nullptr;
+    struct ggml_tensor * dspark_v_ctx       = nullptr;
+    struct ggml_tensor * dspark_k_ctx_norm  = nullptr;
+    struct ggml_tensor * dspark_dflare_norm = nullptr;
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
@@ -824,6 +829,9 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_fuse_alpha   = nullptr; // Inkling2: [n_taps, n_layer + 1] softmaxed DFlare mix weights
+    struct ggml_tensor * dspark_markov_norm  = nullptr; // Inkling2: f_rnn DFlare norm
+    struct ggml_tensor * dspark_markov_w2_b  = nullptr; // Inkling2: folded LM-head bias of the markov latent
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;

@@ -433,7 +433,14 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        // ink2-rvq fork: B70/XeStrata RVQ2X8 (one uint16 code per 8 weights = 2 bits/weight; needs per-row F16 gain
+        // and a per-layer F32 [8,256,2] codebook, passed to MUL_MAT_ID as src[3] / src[4]). Ids 44..149 unused.
+        GGML_TYPE_RVQ2X8  = 150,
+        // ink2-tq fork: B70 trellis tq2 (16x16 tiles of 66 bytes spanning 16 rows; needs per-row F16 gain and F32 signs [K],
+        // passed to MUL_MAT_ID as src[3] / src[4]). Stored as strips: ne = [K*16, rows/16, E], one "row" = 16 real rows = K/16 tiles
+        // (blck 256 / 66 bytes). MUL_MAT_ID takes K = ne[0]/16 and rows = ne[1]*16.
+        GGML_TYPE_TQ2T    = 151,
+        GGML_TYPE_COUNT   = 152,
     };
 
     // [TAG_GGML_PREC]

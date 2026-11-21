@@ -161,6 +161,68 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
+// GB10 GGML_CUDA_MMQ_Q8_REUSE (default 1): the q8_1 copy of src1 is kept (per device, per ds layout) and reused by the
+// next MMQ calls of the same evaluation that read the same src1 (q, k, v, gate, ... of one attention input), as long as
+// no node evaluated in between writes into src1's bytes. Same quantization, same bytes: bit-identical. The buffers only
+// grow (a captured CUDA graph may keep pointing at one) and never during a capture.
+struct mmq_q8_reuse_slot {
+    const ggml_tensor * src1;
+    const void * data;
+    int64_t ne[4];
+    size_t  nb[4];
+    uint64_t epoch;
+    int     node;
+    bool    valid;
+    char *  buf;
+    size_t  cap;
+};
+// per backend context (the DSpark drafter has its own context and stream on the same device): owner -> 3 layouts
+struct mmq_q8_reuse_owner {
+    const void * owner;
+    mmq_q8_reuse_slot s[3];
+};
+static mmq_q8_reuse_owner g_mmq_q8_reuse[8];
+
+static mmq_q8_reuse_slot * mmq_q8_reuse_get(const void * owner, const int layout) {
+    for (auto & o : g_mmq_q8_reuse) {
+        if (o.owner == owner) {
+            return &o.s[layout];
+        }
+    }
+    for (auto & o : g_mmq_q8_reuse) {
+        if (o.owner == nullptr) {
+            o.owner = owner;
+            return &o.s[layout];
+        }
+    }
+    return nullptr;
+}
+
+static bool mmq_q8_reuse_unchanged(const mmq_q8_reuse_slot & c, const ggml_tensor * src1) {
+    const ggml_cuda_eval_pos & ep = g_ggml_cuda_eval_pos;
+    if (!c.valid || c.src1 != src1 || c.data != src1->data || c.epoch != ep.epoch || !ep.cgraph || c.node >= ep.i) {
+        return false;
+    }
+    for (int k = 0; k < 4; ++k) {
+        if (c.ne[k] != src1->ne[k] || c.nb[k] != src1->nb[k]) {
+            return false;
+        }
+    }
+    const uintptr_t lo = (uintptr_t) src1->data, hi = lo + ggml_nbytes(src1);
+    for (int j = c.node + 1; j < ep.i; ++j) {
+        const ggml_tensor * n = ep.cgraph->nodes[j];
+        if (n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+            n->op == GGML_OP_TRANSPOSE || n->data == nullptr) {
+            continue;
+        }
+        const uintptr_t a = (uintptr_t) n->data, b = a + ggml_nbytes(n);
+        if (a < hi && lo < b) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -259,13 +321,40 @@ void ggml_cuda_mul_mat_q(
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // GB10 GGML_CUDA_MMQ_Q8_REUSE (see above): slot per ds layout, q8_1 only
+        static const int q8_reuse = [] { const char * v = getenv("GGML_CUDA_MMQ_Q8_REUSE"); return v ? atoi(v) : 1; }();
+        mmq_q8_reuse_slot * slot = nullptr;
+        bool reuse_hit = false;
+        if (q8_reuse && !use_native_fp4 && g_ggml_cuda_eval_pos.cgraph && g_ggml_cuda_eval_pos.single_stream && ctx.curr_stream_no == 0) {
+            slot = mmq_q8_reuse_get(&ctx, (int) mmq_get_q8_1_ds_layout(src0->type) % 3);
+            reuse_hit = slot && mmq_q8_reuse_unchanged(*slot, src1);
+            if (slot && !reuse_hit && slot->cap < nbytes_src1_q8_1) {
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+                if (cs == cudaStreamCaptureStatusNone) {
+                    const size_t cap = std::max(nbytes_src1_q8_1 + (size_t) 65536, 2*slot->cap);
+                    char * p = nullptr;
+                    if (cudaMalloc((void **) &p, cap) == cudaSuccess) {
+                        slot->buf = p;   // the old buffer is kept: a captured graph may still use it
+                        slot->cap = cap;
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                }
+                if (slot->cap < nbytes_src1_q8_1) {
+                    slot->valid = false;
+                    slot = nullptr;
+                }
+            }
+        }
+        ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+        char * src1_q8_1_ptr = slot ? slot->buf : src1_q8_1_pool.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!reuse_hit) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -273,14 +362,25 @@ void ggml_cuda_mul_mat_q(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1_ptr, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+            if (slot) {
+                slot->src1  = src1;
+                slot->data  = src1->data;
+                for (int k = 0; k < 4; ++k) {
+                    slot->ne[k] = src1->ne[k];
+                    slot->nb[k] = src1->nb[k];
+                }
+                slot->epoch = g_ggml_cuda_eval_pos.epoch;
+                slot->node  = g_ggml_cuda_eval_pos.i;
+                slot->valid = true;
+            }
         }
 
         // Stride depends on quantization format
@@ -290,7 +390,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -315,6 +415,11 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    // expert groups: slots with ids >= GGML_CUDA_MMID_SKIP are never written by the kernel -> must read as zero
+    if (dst->op_params[15] == 0x4D4D4944) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));

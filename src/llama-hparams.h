@@ -108,6 +108,19 @@ struct llama_hparams {
 
     uint32_t n_shortconv_l_cache  = 0;
 
+    // inkling2
+    uint32_t ink_n_embd_r      = 0;  // packed conv state width per cell, overrides n_embd_r()
+    uint32_t ink_d_rel         = 0;
+    uint32_t ink_rel_extent    = 0;
+    uint32_t ink_log_n_floor   = 0;
+    float    ink_log_alpha     = 0.0f;
+    float    ink_qk_clip       = 0.0f;
+    float    ink_rel_clip      = 0.0f;
+    uint32_t ink_res_block     = 0;
+    float    ink_gate_softcap  = 0.0f;
+    float    ink_up_softcap    = 0.0f;
+    uint32_t ink_n_vocab_real  = 0;
+
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
@@ -273,6 +286,7 @@ struct llama_hparams {
     uint32_t n_embd_out_impl = 0;
 
     uint32_t dflash_block_size       = 0;
+    bool     dspark_markov_frnn      = false; // Inkling2 DSpark: rnn markov head also reads f_rnn (mixed features of the last committed token)
     uint32_t dflash_conv_kernel_size = 0;
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;

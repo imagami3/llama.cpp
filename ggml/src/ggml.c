@@ -781,6 +781,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
         .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
     },
+    [GGML_TYPE_RVQ2X8] = {
+        .type_name                = "rvq2x8",
+        .blck_size                = 8,
+        .type_size                = 2,
+        .is_quantized             = true,
+        // no to_float / from_float: a row cannot be decoded without its gain and the layer codebook
+    },
+    [GGML_TYPE_TQ2T] = {
+        .type_name                = "tq2t",
+        .blck_size                = 256,
+        .type_size                = 66,
+        .is_quantized             = true,
+        // no to_float / from_float: a 16x16 tile spans 16 rows and needs the row gains and the input signs
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -3462,10 +3476,13 @@ struct ggml_tensor * ggml_mul_mat_id(
     GGML_ASSERT(b->ne[3] == 1); // b is 3d
     GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
     GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
-    GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
+    // ink2-tq: TQ2T experts are strips of 16 rows: ne = [K*16, rows/16, E]
+    const int64_t as_k    = as->type == GGML_TYPE_TQ2T ? as->ne[0] / 16 : as->ne[0];
+    const int64_t as_rows = as->type == GGML_TYPE_TQ2T ? as->ne[1] * 16 : as->ne[1];
+    GGML_ASSERT(as_k == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
 
-    const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
+    const int64_t ne[4] = { as_rows, ids->ne[0], b->ne[2], 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT_ID;

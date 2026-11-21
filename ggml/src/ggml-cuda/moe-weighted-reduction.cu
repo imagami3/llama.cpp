@@ -14,10 +14,15 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
 
     const uint64_t first_row   = (uint64_t) token * n_expert_used;
     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
+    // GB10/ink2: a slot with weight 0 (GGML_INK_MOE_TOPP dropped it, its expert output is not written) is not read;
+    // the routing weights are never exactly 0 otherwise, so the sums are unchanged
+    float          sum         = weights[first_row] != 0.0f ? (experts[first_row * n_embd + col] * first_scale) * weights[first_row] : 0.0f;
 
     for (int expert = 1; expert < n_expert_used; ++expert) {
         const uint64_t row   = first_row + expert;
+        if (weights[row] == 0.0f) {
+            continue;
+        }
         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
         sum += (experts[row * n_embd + col] * scale) * weights[row];
     }

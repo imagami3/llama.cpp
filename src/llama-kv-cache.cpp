@@ -13,6 +13,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <thread>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1851,6 +1852,102 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::set_input_rel_idx(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t extent) const {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+
+    int32_t * data = (int32_t *) dst->data;
+    const int32_t n_kv = dst->ne[0];
+
+    // GB10/ink2 env LLAMA_INK_RELIDX_FAST (default 1, 0 = the loop below): the cells' positions once per stream (an empty
+    // cell: INT32_MAX, so its distance is negative and it gets `extent`, as the loop gives it), then a branch-free inner
+    // loop the compiler vectorizes, the tokens split over up to LLAMA_INK_RELIDX_THREADS threads (default 8) when the
+    // table is large (41k context, ubatch 1024: 42M entries a ubatch on one thread). Same values.
+    // LLAMA_INK_RELIDX_CHECK=1: also run the loop and abort on any difference (a test).
+    static const bool fast = [] { const char * v = getenv("LLAMA_INK_RELIDX_FAST"); return !v || atoi(v) != 0; }();
+    static const bool check = [] { const char * v = getenv("LLAMA_INK_RELIDX_CHECK"); return v && atoi(v) != 0; }();
+    static const int n_thr_max = [] { const char * v = getenv("LLAMA_INK_RELIDX_THREADS"); return v ? std::max(1, atoi(v)) : 8; }();
+
+    auto slow = [&](int32_t * out) {
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            // per-slot KV (no --kv-unified): each token reads the cells of its own sequence's stream
+            const auto & cells = v_cells[n_stream == 1 ? 0 : seq_to_stream[ubatch->seq_id[i][0]]];
+            const llama_pos pq = ubatch->pos[i];
+            for (int32_t j = 0; j < n_kv; ++j) {
+                int32_t d = extent;
+                if (!cells.is_empty(j)) {
+                    const llama_pos dist = pq - cells.pos_get(j);
+                    if (dist >= 0 && dist < extent) {
+                        d = dist;
+                    }
+                }
+                out[i*n_kv + j] = (int32_t) i*(extent + 1) + d;
+            }
+        }
+    };
+    if (!fast) {
+        slow(data);
+        return;
+    }
+
+    // the cells' positions of each stream the ubatch uses
+    std::vector<std::vector<int32_t>> cpos(n_stream);
+    std::vector<int32_t> tok_stream(n_tokens);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const int32_t s = n_stream == 1 ? 0 : (int32_t) seq_to_stream[ubatch->seq_id[i][0]];
+        tok_stream[i] = s;
+        if (cpos[s].empty()) {
+            const auto & cells = v_cells[s];
+            cpos[s].resize(n_kv);
+            for (int32_t j = 0; j < n_kv; ++j) {
+                cpos[s][j] = cells.is_empty(j) ? std::numeric_limits<int32_t>::max() : (int32_t) cells.pos_get(j);
+            }
+        }
+    }
+    const uint32_t ext = (uint32_t) extent;
+    auto rows = [&](int64_t i0, int64_t i1) {
+        for (int64_t i = i0; i < i1; ++i) {
+            const int32_t * cp = cpos[tok_stream[i]].data();
+            const int32_t pq = (int32_t) ubatch->pos[i];
+            const int32_t base = (int32_t) i*(extent + 1);
+            int32_t * out = data + i*n_kv;
+            for (int32_t j = 0; j < n_kv; ++j) {
+                const int32_t dist = pq - cp[j];   // empty: pq - INT32_MAX < 0
+                out[j] = base + ((uint32_t) dist < ext ? dist : extent);
+            }
+        }
+    };
+    const int64_t n_elem = n_tokens * (int64_t) n_kv;
+    const int n_thr = n_elem >= (1 << 21) ? (int) std::min<int64_t>(n_thr_max, n_tokens) : 1;
+    if (n_thr <= 1) {
+        rows(0, n_tokens);
+    } else {
+        std::vector<std::thread> ths;
+        const int64_t per = (n_tokens + n_thr - 1) / n_thr;
+        for (int t = 1; t < n_thr; ++t) {
+            const int64_t i0 = t*per, i1 = std::min<int64_t>(n_tokens, i0 + per);
+            if (i0 < i1) {
+                ths.emplace_back(rows, i0, i1);
+            }
+        }
+        rows(0, std::min<int64_t>(n_tokens, per));
+        for (auto & th : ths) {
+            th.join();
+        }
+    }
+    if (check) {
+        std::vector<int32_t> ref((size_t) n_elem);
+        slow(ref.data());
+        GGML_ASSERT(memcmp(ref.data(), data, ref.size()*sizeof(int32_t)) == 0 && "LLAMA_INK_RELIDX_CHECK: tables differ");
+        static int n_ok = 0;
+        if (++n_ok <= 3 || n_ok % 100 == 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_INK_RELIDX_CHECK ok (%d tables, last %lld x %d)\n", __func__, n_ok, (long long) n_tokens, n_kv);
+        }
+    }
+}
+
 bool llama_kv_cache::has_cell_ext() const {
     // M-RoPE needs the 2D position, the PLE / Engram n-gram hashes need the token id
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
@@ -2944,6 +3041,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_rel_idx(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t extent) const {
+    kv->set_input_rel_idx(dst, ubatch, extent);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

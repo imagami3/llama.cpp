@@ -235,6 +235,8 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // inkling2: dst I32 [n_kv, n_tokens], row index t*(extent+1) + d (d = pos_q - pos_k in [0, extent), else extent)
+    void set_input_rel_idx(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t extent) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -433,6 +435,8 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // inkling2: dst I32 [n_kv, n_tokens], row index t*(extent+1) + d (d = pos_q - pos_k in [0, extent), else extent)
+    void set_input_rel_idx(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t extent) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

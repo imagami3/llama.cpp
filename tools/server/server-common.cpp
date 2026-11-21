@@ -1499,7 +1499,14 @@ json oaicompat_chat_params_parse(
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-            inputs.chat_template_kwargs.erase("reasoning_effort");
+            // GB10/ink2: Inkling's template ignores enable_thinking and maps a missing reasoning_effort to 0.9 (deep
+            // thinking), so pass "none" through (its effort_map has "none": 0.0) instead of dropping the kwarg
+            static const bool tmpl_has_effort_map = common_chat_templates_source(opt.tmpls.get()).find("effort_map") != std::string::npos;
+            if (tmpl_has_effort_map) {
+                inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            } else {
+                inputs.chat_template_kwargs.erase("reasoning_effort");
+            }
         } else if (!reasoning_effort.empty()) {
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }

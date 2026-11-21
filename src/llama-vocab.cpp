@@ -2672,6 +2672,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN2;
             } else if (
                 tokenizer_pre == "gpt-4o" ||
+                tokenizer_pre == "inkling" ||
+                tokenizer_pre == "inkling2" ||   // GB10/ink2: B70's public TQ1 (PR #32217 converter)
                 tokenizer_pre == "llama4" ||
                 tokenizer_pre == "kanana2" ||
                 tokenizer_pre == "talkie") {

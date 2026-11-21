@@ -1,3 +1,4 @@
+#include "l2clip.cuh"
 #include "common.cuh"
 #include "ggml.h"
 #include "softmax.cuh"
@@ -381,6 +382,10 @@ static void soft_max_back_f32_cuda(
 }
 
 void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->op_params[10] == GGML_CUDA_INK_SM_MAGIC) {
+        ggml_cuda_op_ink_softmax(ctx, dst);   // Inkling 2's fused attention softmax (l2clip.cu)
+        return;
+    }
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];

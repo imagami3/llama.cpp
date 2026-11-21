@@ -24,6 +24,9 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// ink2-rvq: one-time repack of an RVQ2X8 tensor in a CUDA buffer into the kernels' K-tile-major layout (idempotent)
+GGML_BACKEND_API void ggml_backend_cuda_rvq_repack(struct ggml_tensor * tensor);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

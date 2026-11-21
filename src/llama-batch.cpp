@@ -12,6 +12,12 @@
 #include <algorithm>
 #include <sstream>
 
+// GB10/ink2: env LLAMA_UBATCH_EMBD_POOL (default 1): recycled ubatch embd buffers + plain embd batches read in place
+static bool embd_in_place() {
+    static const bool v = [] { const char * e = getenv("LLAMA_UBATCH_EMBD_POOL"); return !e || atoi(e) != 0; }();
+    return v;
+}
+
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed) : n_pos_per_embd(n_pos_per_embd), allow_mixed(allow_mixed) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
@@ -130,7 +136,13 @@ bool llama_batch_allocr::init(
             }
         }
     } else if (has_embd) {
-        embd_vec = batch_inp.embd;
+        // GB10/ink2 (LLAMA_UBATCH_EMBD_POOL=0: off): a plain embd batch is read in place below (batch_inp outlives the
+        // split and its ubatches, which are used before decode/encode returns), no 75 MB copy per DSpark injection chunk
+        if (!embd_in_place()) {
+            embd_vec = batch_inp.embd;
+        } else {
+            embd_vec.clear();
+        }
     }
 
     if (has_state) {
@@ -229,7 +241,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? (!mixed && embd_in_place() ? const_cast<float *>(batch_inp.embd.data()) : embd_vec.data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -866,8 +878,6 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
-    auto udata = std::make_shared<llama_ubatch::data_t>();
-
     const bool mixed_batch = !is_embd_vec.empty();
 
     // a ubatch with a single kind of rows is emitted as a plain token or embd ubatch
@@ -882,9 +892,39 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
     const bool has_state = !state_vec.empty();
 
-    const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
+    // GB10/ink2 (LLAMA_UBATCH_EMBD_POOL=0: off): a plain embd ubatch of consecutive rows points into the batch (valid until
+    // decode/encode returns; readers: the graph input setters) instead of copying 75 MB per DSpark injection chunk
+    bool embd_view = use_embd && !mixed && embd_in_place() && n_tokens > 0;
+    for (uint32_t i = 1; embd_view && i < n_tokens; ++i) {
+        embd_view = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
+    const int64_t n_embd_all  = use_embd && !embd_view ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
+
+    // GB10/ink2: large embedding ubatches take a recycled buffer (every row is overwritten below); the deleter gives it back
+    static const bool use_pool = [] { const char * v = getenv("LLAMA_UBATCH_EMBD_POOL"); return !v || atoi(v) != 0; }();
+    std::shared_ptr<llama_ubatch::data_t> udata;
+    if (use_pool && n_embd_all >= (int64_t) (1 << 20)) {
+        std::shared_ptr<embd_pool> pool = epool;
+        udata = std::shared_ptr<llama_ubatch::data_t>(new llama_ubatch::data_t(), [pool](llama_ubatch::data_t * d) {
+            {
+                std::lock_guard<std::mutex> lock(pool->mtx);
+                if (pool->bufs.size() < 2) {
+                    pool->bufs.push_back(std::move(d->embd));
+                }
+            }
+            delete d;
+        });
+        std::lock_guard<std::mutex> lock(pool->mtx);
+        if (!pool->bufs.empty()) {
+            udata->embd = std::move(pool->bufs.back());
+            pool->bufs.pop_back();
+        }
+    } else {
+        udata = std::make_shared<llama_ubatch::data_t>();
+    }
 
     udata->token     .resize(n_tokens);
     udata->embd      .resize(n_embd_all);
@@ -908,7 +948,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (use_embd) {
+        if (use_embd && !embd_view) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -965,7 +1005,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
-        /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
+        /*.embd         =*/ use_embd  ? (embd_view ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data()) : nullptr,
         /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
@@ -1150,6 +1190,10 @@ size_t llama_batch_ext_select_n_embd_state(llama_context_type ctx_type, const ll
     // TODO: this probably should become a function of `llm_arch`
     if (hparams.lilicorr_candidate_topk > 0) {
         return hparams.n_embd_inp();
+    }
+    if (hparams.dspark_markov_frnn) {
+        // Inkling2 DSpark: raw target taps of the token before each block's anchor (for f_rnn)
+        return hparams.n_embd_inp_enc();
     }
     return 0;
 }

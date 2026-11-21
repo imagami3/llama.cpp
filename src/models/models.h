@@ -2469,6 +2469,46 @@ struct llama_model_lfm2moe : public llama_model_base {
 };
 
 
+struct llama_model_inkling2 : public llama_model_base {
+    llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct ink_layer {
+        ggml_tensor * res_attn_q = nullptr; // [n_embd] or [n_embd, 3]
+        ggml_tensor * res_mlp_q  = nullptr; // [n_embd]
+        ggml_tensor * norm_q = nullptr, * norm_k = nullptr, * norm_v = nullptr; // full layers (sliding: norm_q only)
+        ggml_tensor * wr = nullptr, * wsink = nullptr, * wgate = nullptr;
+        ggml_tensor * q_clip = nullptr, * rel_clip = nullptr, * rel_proj = nullptr;
+        ggml_tensor * sc_k = nullptr, * sc_v = nullptr;                // sliding: static conv [K, kvw]
+        ggml_tensor * dc_k_s = nullptr, * dc_v_s = nullptr;            // full: static taps [kvw, K]
+        ggml_tensor * dc_k_p = nullptr, * dc_v_p = nullptr;            // full: tap proj [n_embd, n_kv*K]
+        ggml_tensor * sc_attn = nullptr, * sc_mlp = nullptr;           // [K, n_embd]
+        ggml_tensor * gate_s = nullptr, * up_s = nullptr, * down_s = nullptr; // per-expert global scales (NVFP4)
+        // expert groups (different quant types / widths within one layer): group 0 = ffn_*_exps, groups 1.. = ffn_*_exps_g{1..7};
+        // router rows are ordered group 0, group 1, ...
+        static constexpr int MAX_GRP = 8;
+        ggml_tensor * gexps[MAX_GRP - 1][3] = {}; // [g-1][gate, up, down]
+        int64_t n_grp = 1;
+        int64_t grp_n[MAX_GRP] = {};
+        // RVQ2X8 experts (B70 format): per-row F16 gains [rows, E_g] per group and matrix, one F32 [8,256,2] codebook per layer
+        ggml_tensor * rvq_gain[MAX_GRP][3] = {}; // [g][gate, up, down]
+        ggml_tensor * rvq_book = nullptr;
+        // TQ2T experts (B70 trellis tq2): per-row F16 gains [rows, E_g] and F32 input signs [K] per group and matrix
+        ggml_tensor * tq_gain[MAX_GRP][3] = {};
+        ggml_tensor * tq_sign[MAX_GRP][3] = {};
+        bool tq = false;
+    };
+    std::vector<ink_layer> ink;
+    ggml_tensor * res_out_q = nullptr;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_lfm3 : public llama_model_base {
     llama_model_lfm3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

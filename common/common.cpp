@@ -1448,7 +1448,9 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 
 // only for warmup and probe decodes, fill zeros as dummy input
 static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
-    zeros.assign(llama_model_n_embd_out(model), 0.0f);
+    // drafts that take target hidden states (DFlash / DSpark) expect one row per extracted target layer
+    const uint32_t n_taps = std::max<uint32_t>(1, llama_model_target_layer_ids_n(model));
+    zeros.assign((size_t) llama_model_n_embd_out(model) * n_taps, 0.0f);
     for (int32_t i = 0; i < batch.size(); ++i) {
         batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
     }

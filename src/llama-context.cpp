@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1529,6 +1530,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // env LLAMA_UB_TIMING=N: every N ubatches print this context's mean host time per ubatch (graph build + alloc,
+    // set inputs, graph launch) and the reuse count
+    static const int ub_timing = [] { const char * v = getenv("LLAMA_UB_TIMING"); return v ? atoi(v) : 0; }();
+    const int64_t t_ub0 = ub_timing ? ggml_time_us() : 0;
+    int64_t t_ub1 = t_ub0, t_ub2 = t_ub0;
+    bool ub_reused = false;
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1547,6 +1555,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        ub_reused = true;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1573,6 +1582,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+
+        // env LLAMA_SPLIT_DEBUG=1: once per context and graph size, list the nodes not on the first (GPU) backend
+        static const bool split_dbg = [] { const char * v = getenv("LLAMA_SPLIT_DEBUG"); return v && atoi(v) != 0; }();
+        if (split_dbg) {
+            static std::set<std::pair<const void *, int>> seen;
+            const auto key = std::make_pair((const void *) this, ggml_graph_n_nodes(gf));
+            if (seen.insert(key).second) {
+                int n_cpu = 0;
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_tensor * t = ggml_graph_node(gf, i);
+                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                    if (b && ggml_backend_is_cpu(b)) {
+                        if (n_cpu++ < 12) {
+                            LLAMA_LOG_WARN("split_debug ctx %p: node %d %s (%s) on CPU\n", (void *) this, i, t->name, ggml_op_desc(t));
+                        }
+                    }
+                }
+                LLAMA_LOG_WARN("split_debug ctx %p (%d layers): %d nodes, %d on CPU, %d splits\n", (void *) this,
+                    (int) model.hparams.n_layer(), ggml_graph_n_nodes(gf), n_cpu, ggml_backend_sched_get_n_splits(sched.get()));
+            }
+        }
     }
 
     // set the input data for the input tensors
@@ -1580,12 +1610,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        t_ub1 = ub_timing ? ggml_time_us() : 0;
         res->set_inputs(&ubatch);
+        t_ub2 = ub_timing ? ggml_time_us() : 0;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (ub_timing) {
+        const int64_t t_ub3 = ggml_time_us();
+        ub_t[0] += t_ub1 - t_ub0; ub_t[1] += t_ub2 - t_ub1; ub_t[2] += t_ub3 - t_ub2;
+        ub_n++; ub_r += ub_reused;
+        if (ub_n >= ub_timing) {
+            LLAMA_LOG_WARN("ub_timing ctx %p (%d layers): %d ubatches, %d reused, mean ms: build+alloc %.3f, set inputs %.3f, launch %.3f, splits %d, nodes %d\n",
+                (void *) this, (int) model.hparams.n_layer(), ub_n, ub_r, ub_t[0] / 1e3 / ub_n, ub_t[1] / 1e3 / ub_n, ub_t[2] / 1e3 / ub_n,
+                ggml_backend_sched_get_n_splits(sched.get()), ggml_graph_n_nodes(res->get_gf()));
+            ub_n = ub_r = 0; ub_t[0] = ub_t[1] = ub_t[2] = 0;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1898,6 +1941,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    // env LLAMA_DECODE_TIMING=1: host time of the steps of each decode call with >= 64 tokens (batch init, scheduler reserve,
+    // memory update + slot search, output reserve, ubatch loop incl. KV apply / graph / inputs / launch, total)
+    static const bool dec_timing = [] { const char * v = getenv("LLAMA_DECODE_TIMING"); return v && atoi(v) != 0; }();
+    const int64_t td0 = dec_timing ? ggml_time_us() : 0;
+    int64_t td1 = td0, td2 = td0, td3 = td0, td4 = td0;
+
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -1905,6 +1954,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+    if (dec_timing) { td1 = ggml_time_us(); }
 
     if (output_all) {
         // require that all tokens are output
@@ -1935,6 +1985,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     embd_batch_idxs.clear();
 
     sched_reserve();
+    if (dec_timing) { td2 = ggml_time_us(); }
 
     bool did_optimize = false;
 
@@ -1986,11 +2037,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    if (dec_timing) { td3 = ggml_time_us(); }
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    if (dec_timing) { td4 = ggml_time_us(); }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -2238,6 +2291,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (dec_timing && n_tokens_all >= 64) {
+        const int64_t td5 = ggml_time_us();
+        LLAMA_LOG_WARN("decode_timing ctx %p (%d layers) n_tokens %u: init %.1f reserve %.1f memory %.1f outputs %.1f ubatches %.1f total %.1f ms\n",
+                (void *) this, (int) model.hparams.n_layer(), n_tokens_all, (td1 - td0) / 1e3, (td2 - td1) / 1e3, (td3 - td2) / 1e3,
+                (td4 - td3) / 1e3, (td5 - td4) / 1e3, (td5 - td0) / 1e3);
+    }
 
     return 0;
 }
@@ -2528,7 +2588,10 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
+    if (model.arch == LLM_ARCH_INKLING2) {
+        // ~600 nodes per layer (dynamic convs, block attention residuals, sink attention) independent of tensor count
+        res = std::max<uint32_t>(1024u * model.hparams.n_layer() + 4096u, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
@@ -2684,6 +2747,27 @@ ggml_cgraph * llama_context::graph_reserve(
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
         llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
         hadamard_verified = true;
+    }
+
+    // env LLAMA_RESERVE_TOP=N: list the N largest nodes of each reserve graph (names, ops, shapes) to see what sizes the compute buffer
+    {
+        static const int rtop = [] { const char * v = getenv("LLAMA_RESERVE_TOP"); return v ? atoi(v) : 0; }();
+        if (rtop > 0 && gf) {
+            std::vector<std::pair<size_t, ggml_tensor *>> v;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                if (t->view_src == nullptr) { v.emplace_back(ggml_nbytes(t), t); }
+            }
+            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            size_t tot = 0; for (auto & e : v) { tot += e.first; }
+            LLAMA_LOG_WARN("reserve_top ctx %p (%d layers) n_tokens %u n_seqs %u: %d nodes, %.1f MiB in non-view nodes\n", (void *) this,
+                    (int) model.hparams.n_layer(), n_tokens, n_seqs, ggml_graph_n_nodes(gf), tot / 1048576.0);
+            for (int i = 0; i < std::min((int) v.size(), rtop); ++i) {
+                ggml_tensor * t = v[i].second;
+                LLAMA_LOG_WARN("reserve_top   %8.1f MiB %-12s %-40s [%lld, %lld, %lld, %lld]\n", v[i].first / 1048576.0, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+            }
+        }
     }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);

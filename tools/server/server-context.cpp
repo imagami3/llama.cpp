@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include <atomic>
 #include <thread>
+#include <map>
 #include "base64.hpp"
 #include "server-chat.h"
 #include "server-common.h"
@@ -3972,6 +3973,64 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // GB10: while some slot is generating, add at most LLAMA_SRV_PP_CAP prompt tokens per step (0 = off), so the
+        // generating slots get a step every short ubatch instead of one per full n_batch of another slot's prompt.
+        // A prompt read alone (nothing generating) still uses the full n_batch.
+        static const int32_t pp_cap = [] { const char * v = getenv("LLAMA_SRV_PP_CAP"); return v ? (int32_t) atoi(v) : (int32_t) 0; }();
+        if (pp_cap > 0 && batch.size() > 0) {
+            n_batch = std::min(n_batch, (int32_t) batch.size() + pp_cap);
+        }
+        // per slot, e.g. LLAMA_SRV_PP_CAP_SLOTS="2:64,1:128": while some slot is generating, that slot adds at most so many
+        // prompt tokens per step (on top of LLAMA_SRV_PP_CAP; the smaller wins). For a background slot whose prompts may
+        // read slowly, so the chat slots keep generating.
+        static const std::map<int, int32_t> pp_cap_slots = [] {
+            std::map<int, int32_t> m;
+            const char * v = getenv("LLAMA_SRV_PP_CAP_SLOTS");
+            if (v) {
+                std::string str(v);
+                size_t pos = 0;
+                while (pos < str.size()) {
+                    size_t end = str.find(',', pos);
+                    if (end == std::string::npos) end = str.size();
+                    const std::string item = str.substr(pos, end - pos);
+                    const size_t c = item.find(':');
+                    if (c != std::string::npos) {
+                        m[atoi(item.substr(0, c).c_str())] = (int32_t) atoi(item.substr(c + 1).c_str());
+                    }
+                    pos = end + 1;
+                }
+            }
+            return m;
+        }();
+        const int32_t n_batch_gen = batch.size();   // tokens of the generating slots already in the batch
+        // interleave: while some slot is generating, a slot adds prompt tokens only every k-th step (the other steps carry
+        // the generating slots alone, which are cheap). LLAMA_SRV_PP_EVERY=k for all slots, LLAMA_SRV_PP_EVERY_SLOTS="2:8,0:2"
+        // per slot (it wins over the global k). 0 / 1 / unset: every step.
+        static const int32_t pp_every = [] { const char * v = getenv("LLAMA_SRV_PP_EVERY"); return v ? (int32_t) atoi(v) : (int32_t) 0; }();
+        static const std::map<int, int32_t> pp_every_slots = [] {
+            std::map<int, int32_t> m;
+            const char * v = getenv("LLAMA_SRV_PP_EVERY_SLOTS");
+            if (v) {
+                std::string str(v);
+                size_t pos = 0;
+                while (pos < str.size()) {
+                    size_t end = str.find(',', pos);
+                    if (end == std::string::npos) end = str.size();
+                    const std::string item = str.substr(pos, end - pos);
+                    const size_t c = item.find(':');
+                    if (c != std::string::npos) {
+                        m[atoi(item.substr(0, c).c_str())] = (int32_t) atoi(item.substr(c + 1).c_str());
+                    }
+                    pos = end + 1;
+                }
+            }
+            return m;
+        }();
+        static uint64_t pp_step = 0;   // counts the steps with a generating slot
+        if (n_batch_gen > 0) {
+            pp_step++;
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -4197,7 +4256,13 @@ private:
                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
 
                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+                            // GB10/ink2: with memory that cannot be rolled back (recurrent state, e.g. Inkling 2's short
+                            // convolutions) a checkpoint holds both the recurrent state and the SWA window at its own position,
+                            // so any checkpoint before pos_eval is a valid restart point; the SWA-only bound (pos_eval - n_swa)
+                            // would reject every checkpoint of a prompt shorter than n_swa and force full re-processing
+                            const bool mem_no_rollback = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+                            const auto pos_min_thold = std::max(0, (n_swa > 0 && !mem_no_rollback) ? pos_eval - n_swa + 2 : pos_eval);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -4461,7 +4526,19 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    int32_t n_batch_slot = n_batch;
+                    if (n_batch_gen > 0) {
+                        const auto it = pp_cap_slots.find(slot.id);
+                        if (it != pp_cap_slots.end() && it->second > 0) {
+                            n_batch_slot = std::min(n_batch, (int32_t) batch.size() + it->second);
+                        }
+                        const auto ie = pp_every_slots.find(slot.id);
+                        const int32_t k = ie != pp_every_slots.end() ? ie->second : pp_every;
+                        if (k > 1 && pp_step % (uint64_t) k != 0) {
+                            n_batch_slot = batch.size();   // a generation-only step for this slot (same path as a full batch)
+                        }
+                    }
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -6477,7 +6554,7 @@ void server_routes::init_routes() {
         const std::string tts_prompt = common_chat_get_tts_prompt(meta->chat_params.tmpls.get(), prompt, lang, voice);
         task.tts_inp.set_prompt(tts_prompt.empty() ? prompt : tts_prompt);
         task.tts_inp.set_lang(lang);
-        task.tts_inp.set_voice(voice);
+        // ink2-vis: upstream mtmd (copied in) has no set_voice; the voice is already part of tts_prompt above
         task.tts_inp.data.stream    = stream;
         task.tts_inp.data.out_type  = response_format == "pcm"
             ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM

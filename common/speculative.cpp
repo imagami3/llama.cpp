@@ -1007,6 +1007,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<float> lilicorr_embd;
     std::vector<llama_pos> lilicorr_pos;
 
+    // Inkling2 DSpark: raw target taps of recent positions, the markov head's f_rnn reads the one before the anchor
+    bool   is_ink2   = false;
+    size_t ink2_rows = 0;
+    std::vector<float>     ink2_feat;
+    std::vector<llama_pos> ink2_pos;
+
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1020,6 +1026,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // dspark speculators
     bool sample_from_anchor = true;
+
+    // adaptive draft count (LLAMA_DSPARK_ADAPT="hi,lo", B70 XeStrata rule): per sequence ema of accepted/drafted (start 0.7);
+    // ema >= hi: n_max drafts, >= lo: 1 draft, else no drafting pass except 1 draft every 16th window (a probe)
+    bool               ad_on = false;
+    float              ad_hi = 0.6f, ad_lo = 0.4f;
+    int                ad_mid = 1;   // drafts when lo <= ema < hi (third field of LLAMA_DSPARK_ADAPT)
+    int                ad_low = -1;  // drafts when ema < lo (fourth field; -1: one window in 16 drafts 1, else none)
+    std::vector<float> ad_ema;
+    std::vector<int>   ad_last;
+    std::vector<int>   ad_win;
 
     // block-internal attention
     bool causal_attn = false;
@@ -1078,6 +1094,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             lilicorr_pos.assign(lilicorr_slots, -1);
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        {
+            char buf[16] = {};
+            is_ink2 = llama_model_meta_val_str(model_dft, "dflash.markov_frnn", buf, sizeof(buf)) >= 0 && std::string(buf) == "true";
+        }
 
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
@@ -1182,6 +1202,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
+        static const int spec_timing = [] { const char * v = getenv("LLAMA_SPEC_TIMING"); return v ? atoi(v) : 0; }();
+        static double pt_acc = 0;
+        static int    pt_n = 0;
+        const int64_t pt0 = spec_timing ? ggml_time_us() : 0;
+        const bool ok = process_impl(batch_in);
+        if (spec_timing) {
+            pt_acc += ggml_time_us() - pt0;
+            if (++pt_n >= spec_timing) {
+                LOG_WRN("spec_timing: %d process calls, mean ms %.3f (host, incl. feature gather)\n", pt_n, pt_acc / 1e3 / pt_n);
+                pt_acc = 0;
+                pt_n = 0;
+            }
+        }
+        return ok;
+    }
+
+    bool process_impl(const common_batch & batch_in) {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1217,6 +1254,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // GB10/ink2 LLAMA_SPEC_TIMING=2: split of one process call (sync = waiting for the target's GPU work, gather =
+        // host copy of the target features, build = draft batch, proc = draft decode incl. its GPU work)
+        static const int spec_split = [] { const char * v = getenv("LLAMA_SPEC_TIMING"); return v ? atoi(v) : 0; }();
+        int64_t ts_sync = 0, ts_gather = 0, ts_build = 0, ts_proc = 0, ts_n = 0;
+        if (spec_split >= 2) {
+            const int64_t t0 = ggml_time_us();
+            llama_synchronize(ctx_tgt);
+            ts_sync = ggml_time_us() - t0;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1235,6 +1282,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
+                const int64_t tg0 = spec_split >= 2 ? ggml_time_us() : 0;
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1248,17 +1296,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                const int64_t tg1 = spec_split >= 2 ? ggml_time_us() : 0;
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                const int64_t tg2 = spec_split >= 2 ? ggml_time_us() : 0;
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (spec_split >= 2) {
+                    llama_synchronize(ctx_dft);
+                    const int64_t tg3 = ggml_time_us();
+                    ts_gather += tg1 - tg0; ts_build += tg2 - tg1; ts_proc += tg3 - tg2; ts_n += n_chunk;
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
+                }
+                if (is_ink2) {
+                    if (ink2_rows == 0) {
+                        ink2_rows = (size_t) block_size + 2;
+                        ink2_feat.resize((size_t) n_seq * ink2_rows * n_embd_enc);
+                        ink2_pos.assign((size_t) n_seq * ink2_rows, -1);
+                    }
+                    const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - (llama_pos) ink2_rows + 1);
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos pos = batch_inject.tokens[i].pos[0];
+                        if (pos < pos_min) {
+                            continue;
+                        }
+                        const size_t slot = (size_t) seq_id * ink2_rows + (size_t) pos % ink2_rows;
+                        std::memcpy(ink2_feat.data() + slot * n_embd_enc, features_buf.data() + (size_t) i * n_embd_enc,
+                                (size_t) n_embd_enc * sizeof(float));
+                        ink2_pos[slot] = pos;
+                    }
                 }
                 if (is_lilicorr) {
                     // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
@@ -1281,6 +1354,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (spec_split >= 2 && ts_n > 0) {
+            LOG_WRN("spec_split: rows %lld sync %.1f gather %.1f build %.1f proc %.1f ms (draft n_ubatch %d)\n", (long long) ts_n,
+                    ts_sync / 1e3, ts_gather / 1e3, ts_build / 1e3, ts_proc / 1e3, n_ubatch);
+        }
         return true;
     }
 
@@ -1288,6 +1365,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
+
+        if (ad_ema.empty()) {
+            const char * v = getenv("LLAMA_DSPARK_ADAPT");
+            ad_on = is_dspark && v && *v && strcmp(v, "0") != 0;
+            if (ad_on) {
+                sscanf(v, "%f,%f,%d,%d", &ad_hi, &ad_lo, &ad_mid, &ad_low);
+                LOG_INF("%s: DSpark adaptive draft count: hi %.2f lo %.2f mid %d low %d\n", __func__, ad_hi, ad_lo, ad_mid, ad_low);
+            }
+            ad_ema.assign(n_seq, 0.7f);
+            ad_last.assign(n_seq, 0);
+            ad_win.assign(n_seq, 0);
+        }
 
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
@@ -1304,12 +1393,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            int32_t n_draft = params.n_max;
+            if (ad_on) {
+                const float e = ad_ema[seq_id];
+                n_draft = e >= ad_hi ? params.n_max : e >= ad_lo ? std::min(ad_mid, params.n_max) :
+                          ad_low >= 0 ? std::min(ad_low, params.n_max) : (ad_win[seq_id] % 16 == 0 ? 1 : 0);
+                ad_win[seq_id]++;
+                if (n_draft == 0) {
+                    continue;   // no drafting pass this window
+                }
+            }
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
+                if (is_ink2 && ink2_rows > 0) {
+                    // f_rnn: taps of the last committed token (position pos0 - 1, the one that produced the anchor)
+                    const llama_pos pos  = dp.pos0 - 1;
+                    const size_t    slot = (size_t) seq_id * ink2_rows + (size_t) std::max(0, pos) % ink2_rows;
+                    if (i == 0 && ink2_pos[slot] != pos) {
+                        LOG_WRN("%s: Inkling2 DSpark: no target taps for pos %d (have %d)\n", __func__, (int) pos, (int) ink2_pos[slot]);
+                    }
+                    batch.set_embd_state(idx, { ink2_feat.data() + slot * n_embd_enc, 1, (size_t) n_embd_enc });
+                }
                 if (is_lilicorr) {
                     // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
                     const llama_pos pos = dp.pos0 - 1;
@@ -1323,12 +1430,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // env LLAMA_SPEC_TIMING=N: every N drafts print the mean host time of this draft's parts (ms)
+        static const int spec_timing = [] { const char * v = getenv("LLAMA_SPEC_TIMING"); return v ? atoi(v) : 0; }();
+        static double st_acc[4] = {0, 0, 0, 0};
+        static int    st_n = 0;
+        const int64_t st0 = spec_timing ? ggml_time_us() : 0;
+
         // decode all sequence's noise block in a single batch
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
+        int64_t st1 = 0, st2 = 0;
+        if (spec_timing) {
+            st1 = ggml_time_us();
+            llama_synchronize(ctx_dft);
+            st2 = ggml_time_us();
+        }
+        struct st_end {
+            int64_t st0, st1, st2;
+            int     on;
+            ~st_end() {
+                if (!on) {
+                    return;
+                }
+                const int64_t st3 = ggml_time_us();
+                st_acc[0] += st1 - st0; st_acc[1] += st2 - st1; st_acc[2] += st3 - st2;
+                if (++st_n >= on) {
+                    LOG_WRN("spec_timing: %d drafts, mean ms: launch %.3f, gpu wait %.3f, sample %.3f\n", st_n,
+                            st_acc[0] / 1e3 / st_n, st_acc[1] / 1e3 / st_n, st_acc[2] / 1e3 / st_n);
+                    st_acc[0] = st_acc[1] = st_acc[2] = 0;
+                    st_n = 0;
+                }
+            }
+        } st_guard{st0, st1, st2, spec_timing};
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1446,6 +1582,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
+                    // GB10: cut the block where the drafter is unsure (env LLAMA_DSPARK_PCUT=p, off by default): the top-1
+                    // share among the top-k candidates' softmax; the first draft always goes
+                    static const float pcut = [] { const char * v = getenv("LLAMA_DSPARK_PCUT"); return v ? (float) atof(v) : 0.0f; }();
+                    if (pcut > 0.0f && i > i_draft_beg && cur_p->size > 1) {
+                        const float l0 = cur_p->data[0].logit;
+                        float z = 0.0f;
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            z += expf(cur_p->data[k].logit - l0);
+                        }
+                        if (1.0f / z < pcut) {
+                            break;
+                        }
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
@@ -1478,11 +1628,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+            if (ad_on) {
+                ad_last[seq_id] = (int) result.size();
+            }
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (ad_on && seq_id >= 0 && (size_t) seq_id < ad_last.size() && ad_last[seq_id] > 0) {
+            ad_ema[seq_id] = 0.9f * ad_ema[seq_id] + 0.1f * std::min(1.0f, (float) n_accepted / ad_last[seq_id]);
+            ad_last[seq_id] = 0;
+        }
     }
 };
 

@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "kqmv.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -661,6 +662,11 @@ static __global__ void mul_mat_vec_q(
 
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
+    // expert-group skip slot: read no weights, write zeros
+    const bool mmid_skip = !shared_expert && ncols_dst == 1 && ids && channel_x >= GGML_CUDA_MMID_SKIP;
+    if (mmid_skip) {
+        channel_x = 0;
+    }
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
@@ -740,7 +746,8 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    const int kbx_end = mmid_skip ? 0 : blocks_per_row_x;
+    for (int kbx = tid / (qi/vdr); kbx < kbx_end; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -940,7 +947,12 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    // expert-group skip slot: read no weights, write zeros
+    const bool mmid_skip = !shared_expert && channel_x >= GGML_CUDA_MMID_SKIP;
+    if (mmid_skip) {
+        channel_x = 0;
+    }
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -950,7 +962,8 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    const int kbx_end = mmid_skip ? 0 : blocks_per_row_x;
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < kbx_end; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
@@ -1458,6 +1471,11 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    if (!ids && !fusion && ggml_cuda_kqmv_supported(src0, src1, dst)) {
+        ggml_cuda_kqmv(ctx, src0, src1, dst);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
