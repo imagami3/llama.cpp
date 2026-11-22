@@ -19,6 +19,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "reasoning-budget.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -28,6 +29,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
+#include <unordered_map>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -257,6 +259,97 @@ struct server_batch {
     }
 };
 
+// GB10/ink2 LLAMA_ANSWER_LOOP (opt-in, env; unset = upstream behaviour): end the answer when its tail is an exact loop,
+// a block of 8..2048 tokens written again and again back to back. The detector is XeStrata's serve/loop_guard.py (from
+// Project Maya); XeStrata first drops the repeats and adds a short penalty, llama.cpp only ends the answer (finish
+// "stop"), so the thresholds are stricter: LLAMA_ANSWER_LOOP=MIN_SPAN,REPS_LONG,REPS_SHORT (1 = 512,4,8): a block of 32+
+// tokens REPS_LONG times or a shorter one REPS_SHORT times, the copies together MIN_SPAN tokens at least.
+// Only the answer is checked: tokens the reasoning-budget sampler counts as thinking are skipped (the sampler is made
+// when this is set), and nothing is checked once a tool call has started (a tool call is never cut).
+// LLAMA_ANSWER_LOOP_NOTE: text added after the loop (default "\n\n[stopped: the answer was repeating itself]"; "" none)
+struct ink_answer_loop_cfg {
+    bool on = false;
+    int p_min = 8, p_max = 2048, short_below = 32, reps_long = 4, reps_short = 8, min_span = 512;
+    std::string note = "\n\n[stopped: the answer was repeating itself]";
+    std::vector<int> need;
+};
+static const ink_answer_loop_cfg & ink_answer_loop() {
+    static const ink_answer_loop_cfg c = [] {
+        ink_answer_loop_cfg r;
+        const char * e = getenv("LLAMA_ANSWER_LOOP");
+        if (!e || !*e || strcmp(e, "0") == 0) {
+            return r;
+        }
+        r.on = true;
+        int a = 0, b = 0, d = 0;
+        if (sscanf(e, "%d,%d,%d", &a, &b, &d) == 3 && a > 0 && b >= 2 && d >= 2) {
+            r.min_span = a; r.reps_long = b; r.reps_short = d;
+        }
+        if (const char * n = getenv("LLAMA_ANSWER_LOOP_NOTE")) {
+            r.note = n;
+        }
+        r.need.assign(r.p_max + 1, 0);
+        for (int p = r.p_min; p <= r.p_max; p++) {
+            const int reps = p < r.short_below ? r.reps_short : r.reps_long;
+            r.need[p] = std::max((reps - 1) * p, r.min_span - p);
+        }
+        LOG_INF("answer-loop guard: on (min span %d tokens, %d copies of a block of %d+ tokens, %d of a shorter one)\n",
+                r.min_span, r.reps_long, r.short_below, r.reps_short);
+        return r;
+    }();
+    return c;
+}
+// the tail's exact periodicity, a token at a time (loop_guard.py LoopDetector.push): runs[p] = how many tokens in a
+// row (to the last one) equal the token p before them; p is a loop once its run reaches need[p]
+struct ink_answer_loop_det {
+    int n = 0;
+    std::unordered_map<llama_token, std::vector<int>> seen;
+    std::unordered_map<int, int> runs;
+    bool off = false;      // a tool call has started
+    void reset() { n = 0; seen.clear(); runs.clear(); off = false; }
+    // returns the loop's period and its run, or 0
+    int push(llama_token t, int & run) {
+        const auto & cfg = ink_answer_loop();
+        const int i = n++;
+        std::unordered_map<int, int> nr;
+        int best = 0;
+        auto it = seen.find(t);
+        if (it == seen.end()) {
+            seen[t].push_back(i);
+        } else {
+            auto & q = it->second;
+            const int lo = i - cfg.p_max;
+            size_t k = 0;
+            while (k < q.size() && q[k] < lo) { k++; }
+            if (k) { q.erase(q.begin(), q.begin() + k); }
+            for (const int j : q) {             // oldest first: the periods from the longest down
+                const int p = i - j;
+                if (p < cfg.p_min) { break; }
+                auto o = runs.find(p);
+                const int r = (o == runs.end() ? 0 : o->second) + 1;
+                nr[p] = r;
+                if (r >= cfg.need[p]) { best = p; run = r; }
+            }
+            q.push_back(i);
+        }
+        runs.swap(nr);
+        return best;
+    }
+};
+// single-token tool-call openers (Inkling's tool-call block and the common ones); a tool call is never cut
+static bool ink_answer_loop_is_tool(const llama_vocab * vocab, llama_token t) {
+    static const std::vector<llama_token> ids = [vocab] {
+        std::vector<llama_token> v;
+        for (const char * m : { "<|content_invoke_tool_json|>", "<tool_call>", "<|tool_call_begin|>", "<|tool_calls_section_begin|>",
+                                "[TOOL_CALLS]", "<|tool_call>", "<|python_tag|>" }) {
+            const auto tk = common_tokenize(vocab, m, false, true);
+            if (tk.size() == 1) { v.push_back(tk[0]); }
+        }
+        return v;
+    }();
+    return std::find(ids.begin(), ids.end(), t) != ids.end();
+}
+
 struct server_slot {
     int id;
 
@@ -323,6 +416,7 @@ struct server_slot {
 
     common_chat_input generated;
     std::string  debug_generated_text;
+    ink_answer_loop_det ink_loop;   // GB10/ink2 LLAMA_ANSWER_LOOP
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
@@ -427,6 +521,7 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated      = {};
+        ink_loop.reset();
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -2146,6 +2241,27 @@ private:
         }
         slot.has_next_token = true;
 
+        // GB10/ink2 LLAMA_ANSWER_LOOP: an answer that loops ends here, with the note after it
+        bool ink_loop_stop = false;
+        if (ink_answer_loop().on && !slot.ink_loop.off && result.tok != LLAMA_TOKEN_NULL) {
+            if (ink_answer_loop_is_tool(vocab, result.tok)) {
+                slot.ink_loop.off = true;
+            } else {
+                const int st = common_sampler_reasoning_state(slot.smpl.get());
+                const bool thinking = st == REASONING_BUDGET_COUNTING || st == REASONING_BUDGET_FORCING || st == REASONING_BUDGET_WAITING_UTF8;
+                int run = 0;
+                const int period = thinking ? 0 : slot.ink_loop.push(result.tok, run);
+                if (period > 0) {
+                    ink_loop_stop = true;
+                    SLT_WRN(slot, "answer-loop guard: a %d-token block %.1f times at answer token %d (n_gen = %d), the answer ends here\n",
+                            period, (double) (run + period) / period, slot.ink_loop.n, (int) slot.stats.n_gen);
+                    if (!ink_answer_loop().note.empty()) {
+                        slot.generated.append(common_chat_input(ink_answer_loop().note));
+                    }
+                }
+            }
+        }
+
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated.text) < slot.generated.text.size();
 
@@ -2257,6 +2373,11 @@ private:
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
+        }
+
+        if (ink_loop_stop && slot.has_next_token) {
+            slot.stop           = STOP_TYPE_EOS;
+            slot.has_next_token = false;
         }
 
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());

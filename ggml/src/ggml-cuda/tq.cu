@@ -584,6 +584,17 @@ static int tq_knob_pf_dbg() {
     return v;
 }
 
+// GGML_TQ_PF_K64 (default 1; 0: the K step of 128): the GPU-sorted prefill MMA kernel steps K by 64 (half the shared
+// memory, more blocks an SM, so one block's decode overlaps another's MMAs; the same MMAs in the same K order: the same
+// bits). GB10, receiver's setting: prefill +7-8% (9k), +7% (41k)
+static bool tq_knob_pf_k64() {
+    static const bool v = [] { const char * e = getenv("GGML_TQ_PF_K64"); return !e || atoi(e) != 0; }();
+    return v;
+}
+static size_t tq_pf_smem(const int N, const int KS) {   // as the kernel's layout: tiles, gains [64], sA [64][KS+8], sB [N][KS+8]
+    return 4 * (size_t) (KS / 16) * TQ_TILE_B + 64 * 4 + (size_t) (64 + N) * (KS + 8) * 2;
+}
+
 // GGML_TQ_PF_NMAX: largest token tile of the fused prefill (128, or 64: experts with more tokens get tiles of 64)
 static int tq_pf_nmax() {
     static const int v = [] { const char * e = getenv("GGML_TQ_PF_NMAX"); return e ? atoi(e) : 32; }();   // pp512 on TQ1: 128 636, 64 700, 32 714 (smaller tiles: more blocks a SM)
@@ -639,7 +650,9 @@ struct tq_glu_args {
 #define TQ_PF_LD (TQ_PF_K + 8)
 #define TQ_PF_SEG (8 * TQ_TILE_B)   // 528 B: one strip's tiles of one step
 
-template <int N, bool MAGIC>
+// KS: the K step (128, or 64 with GGML_PK64=1: half the shared memory, twice the blocks an SM; the MMAs walk K in
+// the same order, so the same bits)
+template <int N, bool MAGIC, int KS = 128>
 static __global__ void __launch_bounds__(128)
 tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, const half * __restrict__ xs,
                const int4 * __restrict__ items, const int32_t * __restrict__ pairs, char * __restrict__ dst, const int K, const int rows,
@@ -649,12 +662,13 @@ tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, c
                const tq_glu_args glu = tq_glu_args()) {
     using namespace nvcuda;
     extern __shared__ __align__(32) char smem_tq[];
+    constexpr int PK = KS, PLD = KS + 8, PSEG = (KS / 16) * TQ_TILE_B, TPS = KS / 16;
     uint8_t * sT = (uint8_t *) smem_tq;                          // 4 x 528 B
-    float   * sg = (float *) (smem_tq + 4 * TQ_PF_SEG);          // [64]
+    float   * sg = (float *) (smem_tq + 4 * PSEG);          // [64]
     half    * sA = (half *) (sg + TQ_PF_M);                      // [64][LD]
-    half    * sB = sA + TQ_PF_M * TQ_PF_LD;                      // [N][LD]
+    half    * sB = sA + TQ_PF_M * PLD;                      // [N][LD]
     float   * sC = (float *) sA;                                 // [N][64], reuses sA / sB after the last K step
-    static_assert(TQ_PF_M * N * 4 <= (TQ_PF_M + N) * TQ_PF_LD * 2, "sC must fit in sA + sB");
+    static_assert(TQ_PF_M * N * 4 <= (TQ_PF_M + N) * PLD * 2, "sC must fit in sA + sB");
 
     int4 it;
     if (meta) {   // GPU-sorted: grid.y is an upper bound of the group's items
@@ -687,22 +701,22 @@ tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, c
     }
 
     const uint8_t * Wb = W + (size_t) e * nb02 + (size_t) (r0 / 16) * nc * TQ_TILE_B;   // first strip of this row tile
-    constexpr int NT = (4 * TQ_PF_SEG / 8 + 127) / 128;   // uint2 of tiles a thread (3)
-    constexpr int NB = N * (TQ_PF_K / 8) / 128;           // uint4 of B a thread
+    constexpr int NT = (4 * PSEG / 8 + 127) / 128;   // uint2 of tiles a thread (3)
+    constexpr int NB = (N * (PK / 8) + 127) / 128;   // uint4 of B a thread
     int brow[NB];
 #pragma unroll
     for (int i = 0; i < NB; ++i) {
-        const int n = (tid + i * 128) / (TQ_PF_K / 8);
+        const int n = (tid + i * 128) / (PK / 8);
         brow[i] = n < nt ? (tokx ? pairs[j0 + n] / tokx : j0 + n) : 0;
     }
     auto load_step = [&](const int k0, uint2 (&ct)[NT], uint4 (&cb)[NB]) {
         const int jt0 = k0 / 16;
-        const int nck = min(8, nc - jt0);
+        const int nck = min(TPS, nc - jt0);
         const int seg8 = nck * TQ_TILE_B / 8;   // uint2 a strip this step (66 or 33)
 #pragma unroll
         for (int i = 0; i < NT; ++i) {
             const int q = tid + i * 128;
-            const int sl = q / (TQ_PF_SEG / 8), w = q % (TQ_PF_SEG / 8);
+            const int sl = q / (PSEG / 8), w = q % (PSEG / 8);
             ct[i] = make_uint2(0, 0);
             if (sl < 4 && w < seg8) {
                 ct[i] = __ldg((const uint2 *) (Wb + (size_t) sl * nc * TQ_TILE_B + (size_t) jt0 * TQ_TILE_B) + w);
@@ -711,9 +725,9 @@ tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, c
 #pragma unroll
         for (int i = 0; i < NB; ++i) {
             const int q = tid + i * 128;
-            const int n = q / (TQ_PF_K / 8), c = q % (TQ_PF_K / 8);
+            const int n = q / (PK / 8), c = q % (PK / 8);
             cb[i] = make_uint4(0, 0, 0, 0);
-            if (n < nt && c < nck * 2) {
+            if (q < N * (PK / 8) && n < nt && c < nck * 2) {
                 cb[i] = *(const uint4 *) (xs + (size_t) brow[i] * K + k0 + c * 8);
             }
         }
@@ -721,32 +735,34 @@ tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, c
     uint2 ct[NT];
     uint4 cb[NB];
     load_step(0, ct, cb);
-    for (int k0 = 0; k0 < K; k0 += TQ_PF_K) {
-        const int nck = min(8, nc - k0 / 16);
+    for (int k0 = 0; k0 < K; k0 += PK) {
+        const int nck = min(TPS, nc - k0 / 16);
 #pragma unroll
         for (int i = 0; i < NT; ++i) {
             const int q = tid + i * 128;
-            if (q < 4 * TQ_PF_SEG / 8) {
+            if (q < 4 * PSEG / 8) {
                 ((uint2 *) sT)[q] = ct[i];
             }
         }
 #pragma unroll
         for (int i = 0; i < NB; ++i) {
             const int q = tid + i * 128;
-            const int n = q / (TQ_PF_K / 8), c = q % (TQ_PF_K / 8);
-            *(uint4 *) (sB + n * TQ_PF_LD + c * 8) = cb[i];
+            const int n = q / (PK / 8), c = q % (PK / 8);
+            if (q < N * (PK / 8)) {
+                *(uint4 *) (sB + n * PLD + c * 8) = cb[i];
+            }
         }
         __syncthreads();
-        if (k0 + TQ_PF_K < K) {
-            load_step(k0 + TQ_PF_K, ct, cb);   // in flight during the decode and the MMAs
+        if (k0 + PK < K) {
+            load_step(k0 + PK, ct, cb);   // in flight during the decode and the MMAs
         }
         // decode: unit u = (strip sl, tile jt, tile row r)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < TPS / 2; ++i) {   // 4 strips x TPS tiles x 16 rows over 128 threads
             const int u = tid + i * 128;
-            const int sl = u >> 7, jt = (u >> 4) & 7, r = u & 15;
+            const int sl = u / (TPS * 16), jt = (u / 16) % TPS, r = u & 15;
             if (jt < nck && dbg != 1) {
-                const uint16_t * tb = (const uint16_t *) (sT + sl * TQ_PF_SEG + jt * TQ_TILE_B);
+                const uint16_t * tb = (const uint16_t *) (sT + sl * PSEG + jt * TQ_TILE_B);
                 auto SB = [&](const int k) -> uint32_t { return (uint32_t) tb[1 + 2*k] | ((uint32_t) tb[2 + 2*k] << 16); };
                 const uint32_t sbr = SB(r);
                 const uint32_t lo = r == 0 ? ((tb[0] & 0x3fffu) | (sbr << 14)) : ((SB(r - 1) >> 18) | (sbr << 14));
@@ -759,7 +775,7 @@ tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, c
                     const uint32_t b1 = tq_bsum((uint32_t) (ch >> (2*c + 2)) & 0x3fffu);
                     o[c/2] = MAGIC ? tq_h2(b0, b1) : __floats2half2_rn((float) ((int) b0 - 510), (float) ((int) b1 - 510));
                 }
-                uint4 * dp = (uint4 *) (sA + (sl * 16 + r) * TQ_PF_LD + jt * 16);
+                uint4 * dp = (uint4 *) (sA + (sl * 16 + r) * PLD + jt * 16);
                 dp[0] = *(const uint4 *) &o[0];
                 dp[1] = *(const uint4 *) &o[4];
             }
@@ -767,11 +783,11 @@ tq_prefill_mma(const uint8_t * __restrict__ W, const half * __restrict__ gain, c
         __syncthreads();
         for (int kk = 0; kk < (dbg == 2 ? 0 : nck * 16); kk += 16) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
-            wmma::load_matrix_sync(fa, sA + (warp * 16) * TQ_PF_LD + kk, TQ_PF_LD);
+            wmma::load_matrix_sync(fa, sA + (warp * 16) * PLD + kk, PLD);
 #pragma unroll
             for (int f = 0; f < NF; ++f) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fb, sB + (f * 16) * TQ_PF_LD + kk, TQ_PF_LD);
+                wmma::load_matrix_sync(fb, sB + (f * 16) * PLD + kk, PLD);
                 wmma::mma_sync(acc[f], fa, fb, acc[f]);
             }
         }
@@ -2153,25 +2169,27 @@ static bool tq_pf_multi_gpu(ggml_backend_cuda_context & ctx, const ggml_cgraph *
             if (red) {
                 CUDA_CHECK(cudaMemsetAsync(red, 0, (size_t) ids->ne[1] * last->ne[0] * sizeof(float), stream));
             }
-            const size_t smem32 = 4 * TQ_PF_SEG + TQ_PF_M * 4 + (TQ_PF_M + 32) * TQ_PF_LD * 2;
-            const size_t smem64 = 4 * TQ_PF_SEG + TQ_PF_M * 4 + (TQ_PF_M + 64) * TQ_PF_LD * 2;
-            CUDA_CHECK(cudaFuncSetAttribute(tq_prefill_mma<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem32));
-            CUDA_CHECK(cudaFuncSetAttribute(tq_prefill_mma<64, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem64));
+            const int ks = tq_knob_pf_k64() ? 64 : 128;
+            const size_t smem32 = tq_pf_smem(32, ks), smem64 = tq_pf_smem(64, ks);
+            auto * const k32 = ks == 64 ? tq_prefill_mma<32, true, 64> : tq_prefill_mma<32, true, 128>;
+            auto * const k64 = ks == 64 ? tq_prefill_mma<64, true, 64> : tq_prefill_mma<64, true, 128>;
+            CUDA_CHECK(cudaFuncSetAttribute(k32, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem32));
+            CUDA_CHECK(cudaFuncSetAttribute(k64, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem64));
             for (int m = 0; m < n; ++m) {
                 const ggml_tensor * d = cgraph->nodes[i + m];
                 const ggml_tensor * src0 = d->src[0];
                 const int rows = src0->ne[1] * 16;
                 const int ne = (int) src0->ne[2];
                 const dim3 grid(rows / TQ_PF_M, g_gluf.big ? ne + 1 : NP / 32 + ne + 1);
-                tq_prefill_mma<32, true><<<grid, 128, smem32, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data,
+                k32<<<grid, 128, smem32, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data,
                     g_gluf.xd, g_gluf.items, g_gluf.pairs, (char *) last->data, g_gluf.K[m], rows, src0->nb[2], (int) ids->ne[0],
-                    last->nb[1], last->nb[2], tq_knob_pf_dbg(), g_gluf.meta, g_gluf.mg[m], 16 + m, 0, red, rw, rsc);
+                    last->nb[1], last->nb[2], tq_knob_pf_dbg(), g_gluf.meta, g_gluf.mg[m], 16 + m, 0, red, rw, rsc, tq_glu_args());
                 CUDA_CHECK(cudaGetLastError());
                 if (g_gluf.big) {
                     const dim3 grid64(rows / TQ_PF_M, NP / 64 + std::min(ne, NP / 33) + 1);
-                    tq_prefill_mma<64, true><<<grid64, 128, smem64, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data,
+                    k64<<<grid64, 128, smem64, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data,
                         g_gluf.xd, g_gluf.items, g_gluf.pairs, (char *) last->data, g_gluf.K[m], rows, src0->nb[2], (int) ids->ne[0],
-                        last->nb[1], last->nb[2], tq_knob_pf_dbg(), g_gluf.meta, g_gluf.mg[m], 16 + m, 0, red, rw, rsc);
+                        last->nb[1], last->nb[2], tq_knob_pf_dbg(), g_gluf.meta, g_gluf.mg[m], 16 + m, 0, red, rw, rsc, tq_glu_args());
                     CUDA_CHECK(cudaGetLastError());
                 }
             }
@@ -2357,12 +2375,14 @@ static bool tq_pf_multi_gpu(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     if (red) {   // after the gather: the sum's buffer may be the memory of the gate / up outputs it reads
         CUDA_CHECK(cudaMemsetAsync(red, 0, (size_t) a.n_tok * last->ne[0] * sizeof(float), stream));
     }
-    const size_t smem   = 4 * TQ_PF_SEG + TQ_PF_M * 4 + (TQ_PF_M + 32) * TQ_PF_LD * 2;
-    const size_t smem64 = 4 * TQ_PF_SEG + TQ_PF_M * 4 + (TQ_PF_M + 64) * TQ_PF_LD * 2;
+    const int ks = tq_knob_pf_k64() ? 64 : 128;
+    const size_t smem = tq_pf_smem(32, ks), smem64 = tq_pf_smem(64, ks);
+    auto * const k32 = ks == 64 ? tq_prefill_mma<32, true, 64> : tq_prefill_mma<32, true, 128>;
+    auto * const k64 = ks == 64 ? tq_prefill_mma<64, true, 64> : tq_prefill_mma<64, true, 128>;
     static bool smem_set = false;
     if (!smem_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(tq_prefill_mma<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-        CUDA_CHECK(cudaFuncSetAttribute(tq_prefill_mma<64, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem64));
+        CUDA_CHECK(cudaFuncSetAttribute(k32, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        CUDA_CHECK(cudaFuncSetAttribute(k64, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem64));
         smem_set = true;
     }
     for (int m = 0; m < n; ++m) {
@@ -2378,13 +2398,13 @@ static bool tq_pf_multi_gpu(ggml_backend_cuda_context & ctx, const ggml_cgraph *
         if (gl.other) {
             gl.xd = g_gluf.xd;
         }
-        tq_prefill_mma<32, true><<<grid, 128, smem, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data, xm, items_p,
+        k32<<<grid, 128, smem, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data, xm, items_p,
             pairs_p, out, K, rows, src0->nb[2], a.n_used, onb1, onb2, tq_knob_pf_dbg(), meta_p, a.mg[m], m, tokx ? a.n_used : 0,
             red, rw, rsc, gl);
         CUDA_CHECK(cudaGetLastError());
         if (a.big) {
             const dim3 grid64(rows / TQ_PF_M, NP / 64 + std::min(ne, NP / 33) + 1);
-            tq_prefill_mma<64, true><<<grid64, 128, smem64, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data, xm,
+            k64<<<grid64, 128, smem64, stream>>>((const uint8_t *) src0->data, (const half *) d->src[3]->data, xm,
                 items_p, pairs_p, out, K, rows, src0->nb[2], a.n_used, onb1, onb2, tq_knob_pf_dbg(), meta_p, a.mg[m], m,
                 tokx ? a.n_used : 0, red, rw, rsc, gl);
             CUDA_CHECK(cudaGetLastError());

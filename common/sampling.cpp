@@ -459,6 +459,13 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
+int common_sampler_reasoning_state(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->rbudget) {
+        return -1;
+    }
+    return (int) common_reasoning_budget_get_state(gsmpl->rbudget);
+}
+
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;

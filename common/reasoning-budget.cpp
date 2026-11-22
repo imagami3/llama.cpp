@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 #include <unordered_map>
 #include <cstdint>
@@ -91,7 +92,11 @@ static int ink_rb_loop_window_max() {
     static const int w = [] { int m = 0; for (const auto & r : ink_rb_loop()) { m = std::max(m, r.window); } return m; }();
     return w;
 }
-bool common_reasoning_budget_loop_enabled() { return !ink_rb_loop().empty(); }
+// (LLAMA_ANSWER_LOOP, the server's answer-loop guard, also needs the sampler: its state tells the thought from the answer)
+bool common_reasoning_budget_loop_enabled() {
+    static const bool answer_loop = [] { const char * e = getenv("LLAMA_ANSWER_LOOP"); return e && *e && strcmp(e, "0") != 0; }();
+    return !ink_rb_loop().empty() || answer_loop;
+}
 
 // UTF-8 bytes -> code points (a cut first character is skipped, a cut last one is left out)
 static std::u32string ink_rb_cpts(const std::string & s) {

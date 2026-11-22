@@ -475,7 +475,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
 
-    if (int(tokens.size()) < 2*n_ctx) {
+    if (int(tokens.size()) < (getenv("LLAMA_PPL_POSNLL") ? n_ctx : 2*n_ctx)) {
         LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
                 n_ctx);
         LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
@@ -508,7 +508,16 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     common_batch batch(ctx);
 
     std::vector<float> logits;
-    if (num_batches > 1) {
+    // GB10/ink2: LLAMA_PPL_POSNLL=file scores every position and writes its NLL (float32, n_ctx-1 per chunk)
+    // straight after each decode, so no chunk-sized logits buffer is kept (long contexts)
+    const char * posnll_path = getenv("LLAMA_PPL_POSNLL");
+    FILE * posnll_f = posnll_path ? fopen(posnll_path, "wb") : nullptr;
+    std::vector<float> posnll;
+    if (posnll_f) {
+        GGML_ASSERT(n_seq == 1);
+        posnll.resize(n_ctx - 1);
+    }
+    if (num_batches > 1 && !posnll_f) {
         logits.reserve(size_t(n_ctx) * n_vocab);
     }
 
@@ -537,7 +546,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
+    const int first = posnll_f ? 0 : n_ctx/2;
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -584,10 +593,43 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 return {tokens, -1, logit_history, prob_history};
             }
 
-            if (num_batches > 1 && n_outputs > 0) {
+            if (posnll_f && n_outputs > 0) {
+                const float * bl = llama_get_logits(ctx);
+                const int p0 = j*n_batch;
+                const int nw = 16;
+                std::vector<std::thread> th;
+                for (int w = 0; w < nw; ++w) {
+                    th.emplace_back([&, w]() {
+                        for (int k = w; k < batch_size; k += nw) {
+                            const int pos = p0 + k;
+                            if (pos + 1 >= n_ctx) continue;
+                            const float * lg = bl + size_t(k) * n_vocab;
+                            float mx = lg[0];
+                            for (int v = 1; v < n_vocab; ++v) mx = std::max(mx, lg[v]);
+                            double sum = 0.0;
+                            for (int v = 0; v < n_vocab; ++v) sum += std::exp(double(lg[v] - mx));
+                            const llama_token nt = tokens[start + pos + 1];
+                            posnll[pos] = float(std::log(sum) - double(lg[nt] - mx));
+                        }
+                    });
+                }
+                for (auto & t : th) t.join();
+            } else if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
+        }
+
+        if (posnll_f) {
+            fwrite(posnll.data(), sizeof(float), posnll.size(), posnll_f);
+            fflush(posnll_f);
+            double cs = 0.0; for (float x : posnll) cs += x;
+            LOG("[%d] mean nll %.5f\n", i + 1, cs / posnll.size());
+            if (i == 0) {
+                const auto t_end = std::chrono::high_resolution_clock::now();
+                LOG_INF("%s: %.2f seconds per pass\n", __func__, std::chrono::duration<float>(t_end - t_start).count());
+            }
+            continue;
         }
 
 
