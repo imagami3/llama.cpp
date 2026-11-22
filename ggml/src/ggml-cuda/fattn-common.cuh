@@ -1187,7 +1187,12 @@ void launch_fattn(
     //     multiple sequences of possibly different lengths.
     // GB10/ink2 (env GGML_INK_FA_KVMIN, default 1): also scan for the first visible tile (sliding-window layers), from 64 queries
     static const bool ink_kvmin = [] { const char * v = getenv("GGML_INK_FA_KVMIN"); return !v || atoi(v) != 0; }();
-    const bool scan_min  = ink_kvmin && ggml_cuda_is_ink_fa(KQV) && !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 64;
+    // GB10/ink2 (env GGML_INK_FA_KVMIN_DEC, default 4096, 0 = off): the same two scans for fewer queries (decode, draft
+    // checks) once the cache view has that many cells: with the unified cache of several server slots (-np), a slot's keys
+    // come after the other slots' kept cells, which its mask hides; skipping those tiles leaves the result as it is
+    static const int ink_kvmin_dec = [] { const char * v = getenv("GGML_INK_FA_KVMIN_DEC"); return v ? atoi(v) : 4096; }();
+    const bool scan_min  = ink_kvmin && ggml_cuda_is_ink_fa(KQV) && !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                           (Q->ne[1] >= 64 || (ink_kvmin_dec > 0 && K->ne[1] >= ink_kvmin_dec));
     const bool scan_mask = scan_min || (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1));
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
